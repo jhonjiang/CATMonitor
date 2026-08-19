@@ -16,10 +16,12 @@ type Config struct {
 	Storage         StorageConfig           `yaml:"storage"`
 	Health          HealthConfig            `yaml:"health"`
 	Collection      CollectionConfig        `yaml:"collection"`
-	Features        []string                `yaml:"features"`        // enabled features; daemon loads features/<name>/metrics.yaml overrides + derives C_comp from their intervals
+	Features        []string                `yaml:"features"` // enabled features; daemon loads features/<name>/metrics.yaml overrides + derives C_comp from their intervals
 	FaultSub        FaultSubConfig          `yaml:"faultsub"`
 	StragglerOutput StragglerOutputConfig   `yaml:"straggler_output"`
 	Snapshot        SnapshotConfig          `yaml:"snapshot"`
+	Energysave      EnergysaveConfig        `yaml:"energysave"`
+	Nputurbo        NputurboConfig          `yaml:"nputurbo"`
 }
 
 // ServerConfig holds server-level configuration.
@@ -45,8 +47,8 @@ type StorageConfig struct {
 // dead config.) WeightScheme selects the scoring weights ("auto" detects
 // gpu/npu).
 type HealthConfig struct {
-	Enabled      bool          `yaml:"enabled"`
-	WeightScheme string        `yaml:"weight_scheme"` // auto | cpu_only | accelerated_8card | accelerated_4card
+	Enabled      bool   `yaml:"enabled"`
+	WeightScheme string `yaml:"weight_scheme"` // auto | cpu_only | accelerated_8card | accelerated_4card
 }
 
 // CollectionConfig controls which metrics are collected (pre-filter by priority).
@@ -58,13 +60,13 @@ type CollectionConfig struct {
 // When Enabled is false (the default) the daemon skips the feature entirely
 // and behaves exactly as before.
 type FaultSubConfig struct {
-	Enabled        bool            `yaml:"enabled"`          // opt-in switch
-	RestAddr       string          `yaml:"rest_addr"`        // subscription REST API listen address
-	WebhookTimeout time.Duration   `yaml:"webhook_timeout"`  // per-request webhook timeout
-	WebhookRetry   int             `yaml:"webhook_retry"`    // failed-webhook retry count
-	EventBuffer    int             `yaml:"event_buffer"`     // recent-event ring buffer size
+	Enabled        bool             `yaml:"enabled"`         // opt-in switch
+	RestAddr       string           `yaml:"rest_addr"`       // subscription REST API listen address
+	WebhookTimeout time.Duration    `yaml:"webhook_timeout"` // per-request webhook timeout
+	WebhookRetry   int              `yaml:"webhook_retry"`   // failed-webhook retry count
+	EventBuffer    int              `yaml:"event_buffer"`    // recent-event ring buffer size
 	Defaults       FaultSubDefaults `yaml:"defaults"`
-	Rules          map[string]bool `yaml:"rules"`
+	Rules          map[string]bool  `yaml:"rules"`
 }
 
 // FaultSubDefaults holds subscription defaults applied when a subscriber
@@ -82,7 +84,7 @@ type StragglerOutputConfig struct {
 	DataDir       string        `yaml:"data_dir"`       // KPI file directory
 	Retention     time.Duration `yaml:"retention"`      // file retention (default 15d)
 	FlushInterval time.Duration `yaml:"flush_interval"` // in-memory buffer flush cadence
-	Metrics       []string      `yaml:"metrics"`         // which straggler fields to emit (empty=all)
+	Metrics       []string      `yaml:"metrics"`        // which straggler fields to emit (empty=all)
 }
 
 // SnapshotConfig controls daemon-side snapshot production (per-component
@@ -97,6 +99,40 @@ type SnapshotConfig struct {
 	Dir     string `yaml:"dir"` // directory for snapshot_<comp>.json + snapshot.json
 }
 
+// EnergysaveConfig holds the cpugov (CPU-senses-NPU) actuator configuration
+// (SPEC: features/cpugov/cpugov_SPEC.md). Writes to sysfs require root; the
+// feature is off by default and starts in dry_run (read-only) mode.
+type EnergysaveConfig struct {
+	Enabled             bool          `yaml:"enabled"`                // default false
+	Interval            time.Duration `yaml:"interval"`               // control loop period
+	CpuIdleThresholdPct float64       `yaml:"cpu_idle_threshold_pct"` // idle% >= this => idle sample
+	ObserveWindow       time.Duration `yaml:"observe_window"`         // x seconds sustained idle to confirm
+	NonIdleBreak        int           `yaml:"non_idle_break"`         // consecutive non-idle to abort
+	DryRun              bool          `yaml:"dry_run"`                // true = judge+log only, no sysfs write
+	MinFreqOverride     uint64        `yaml:"min_freq_override"`      // 0 = use cpuinfo_min_freq
+	NpuStaleSec         int           `yaml:"npu_stale_sec"`          // NPU data staleness threshold (sec)
+}
+
+// NputurboConfig holds the NPU slow-card upclock actuator (nputurbo)
+// configuration (SPEC: features/nputurbo/nputurbo_SPEC.md). Actuation execs
+// /var/npu_turbo; the feature is off by default and starts in dry_run
+// (judge+log) mode. Current frequency is read from snapshot_npu.json's
+// aicore_freq, so snapshot.enabled is a precondition.
+type NputurboConfig struct {
+	Enabled           bool          `yaml:"enabled"`             // default false
+	Interval          time.Duration `yaml:"interval"`            // control loop period (file poll cadence)
+	StragglerCmd      string        `yaml:"straggler_cmd"`       // straggler command template; {path} replaced
+	ResultPath        string        `yaml:"result_path"`         // where straggler writes its jsonl result
+	StragglerTimeout  time.Duration `yaml:"straggler_timeout"`   // straggler exec timeout
+	NpuTurboCmd       string        `yaml:"npu_turbo_cmd"`       // inject command template; {id}/{freq} replaced
+	NpuTurboCleanCmd  string        `yaml:"npu_turbo_clean_cmd"` // clean command (restores all cards); run as-is
+	NpuTurboTimeout   time.Duration `yaml:"npu_turbo_timeout"`   // npu_turbo exec timeout
+	MaxFreqMhz        int           `yaml:"max_freq_mhz"`        // M (hard cap on boost target)
+	StepMhz           int           `yaml:"step_mhz"`            // boost target quantization step
+	DryRun            bool          `yaml:"dry_run"`             // true = judge+log only, no npu_turbo exec
+	RestoreOnShutdown bool          `yaml:"restore_on_shutdown"` // restore boosted freqs on graceful shutdown
+}
+
 // Default returns the default configuration.
 func Default() *Config {
 	return &Config{
@@ -105,12 +141,12 @@ func Default() *Config {
 		},
 		Collectors: map[string]CollectorCfg{
 			"chassis": {Enabled: true, Interval: 3 * time.Second},
-			"cpu":      {Enabled: true, Interval: 3 * time.Second},
-			"memory":   {Enabled: true, Interval: 3 * time.Second},
-			"disk":     {Enabled: true, Interval: 5 * time.Second},
-			"gpu":      {Enabled: true, Interval: 3 * time.Second},
-			"npu":      {Enabled: true, Interval: 3 * time.Second},
-			"network":  {Enabled: true, Interval: 3 * time.Second},
+			"cpu":     {Enabled: true, Interval: 3 * time.Second},
+			"memory":  {Enabled: true, Interval: 3 * time.Second},
+			"disk":    {Enabled: true, Interval: 5 * time.Second},
+			"gpu":     {Enabled: true, Interval: 3 * time.Second},
+			"npu":     {Enabled: true, Interval: 3 * time.Second},
+			"network": {Enabled: true, Interval: 3 * time.Second},
 		},
 		Storage: StorageConfig{
 			DataDir:    platform.DataDir(),
@@ -141,6 +177,30 @@ func Default() *Config {
 		Snapshot: SnapshotConfig{
 			Enabled: false, // opt-in; daemon unchanged when off
 			Dir:     platform.DataDir() + "/snapshot",
+		},
+		Energysave: EnergysaveConfig{
+			Enabled:             false,
+			Interval:            3 * time.Second,
+			CpuIdleThresholdPct: 97,
+			ObserveWindow:       120 * time.Second,
+			NonIdleBreak:        2,
+			DryRun:              true,
+			MinFreqOverride:     0,
+			NpuStaleSec:         6,
+		},
+		Nputurbo: NputurboConfig{
+			Enabled:           false,
+			Interval:          60 * time.Second,
+			StragglerCmd:      "straggler path={path}",
+			ResultPath:        "/var/lib/catmonitor/nputurbo/straggler_result.jsonl",
+			StragglerTimeout:  60 * time.Second,
+			NpuTurboCmd:       "/home/jw/npu_turbo_one.sh inject -n {id} -f {freq}",
+			NpuTurboCleanCmd:  "/home/jw/npu_turbo_one.sh clean",
+			NpuTurboTimeout:   10 * time.Second,
+			MaxFreqMhz:        1900,
+			StepMhz:           50,
+			DryRun:            true,
+			RestoreOnShutdown: true,
 		},
 	}
 }

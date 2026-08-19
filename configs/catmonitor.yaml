@@ -47,7 +47,7 @@ collection:
 # min across the listed features' declared intervals (falling back to
 # collectors.<name>.interval for components no feature declares). Empty = use the
 # default catalog (configs/metrics.yaml) + collectors.interval only.
-features: [web, dfee, health]
+features: [web, dfee, health, cpugov, nputurbo]
 
 # Fault subscription & push mechanism (features/faultsub). Default off; enable
 # to let external fault managers (e.g. EEP) subscribe to NPU fault events via
@@ -87,3 +87,38 @@ straggler_output:
 snapshot:
   enabled: true
   dir: /var/lib/catmonitor/snapshot   # directory for snapshot_<comp>.json + snapshot.json
+
+# CPU-senses-NPU energy saver (features/cpugov). Default off; actuation writes
+# to sysfs (scaling_*_freq), requiring root + dry_run: false. Reads
+# snapshot_cpu.json + snapshot_npu.json, so snapshot.enabled is a precondition.
+# dry_run defaults true (judge+log only); set dry_run: false + run as root to
+# actuate. See features/cpugov/cpugov_SPEC.md.
+energysave:
+  enabled: true
+  interval: 3s
+  cpu_idle_threshold_pct: 97
+  observe_window: 120s
+  non_idle_break: 2
+  dry_run: true
+  min_freq_override: 0
+  npu_stale_sec: 6
+
+# NPU slow-card upclock actuator (features/nputurbo). Default off; actuation
+# execs /var/npu_turbo. Current freq is read from snapshot_npu.json's
+# aicore_freq, so snapshot.enabled is a precondition. The daemon polls the
+# straggler detector (exec straggler path=<result_path>) every interval to
+# refresh the slow-card list. dry_run defaults true (judge+log only); set
+# dry_run: false + run as root to actuate. See features/nputurbo/nputurbo_SPEC.md.
+nputurbo:
+  enabled: false
+  interval: 60s
+  straggler_cmd: "straggler path={path}"
+  result_path: /var/lib/catmonitor/nputurbo/straggler_result.jsonl
+  straggler_timeout: 60s
+  npu_turbo_cmd: "/home/jw/npu_turbo_one.sh inject -n {id} -f {freq}"
+  npu_turbo_clean_cmd: "/home/jw/npu_turbo_one.sh clean"
+  npu_turbo_timeout: 10s
+  max_freq_mhz: 1900
+  step_mhz: 50
+  dry_run: true
+  restore_on_shutdown: true
