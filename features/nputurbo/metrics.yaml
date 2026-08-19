@@ -1,14 +1,8 @@
-# nputurbo feature scope: the metrics the NPU slow-card upclock actuator needs.
-#   npu.aicore_freq  -> current AICore frequency (input A for the boost formula)
-#   nputurbo.*       -> actuator state metrics (observability)
-# Scoping aicore_freq to High keeps it in snapshot_npu.json so the controller
-# can read the per-card current frequency.
+# nputurbo feature scope: the actuator state metrics (observability) it emits.
+# A (the boost-formula baseline) is the fixed constant fixedCurrentMHz=1800;
+# nputurbo no longer reads npu.aicore_freq from snapshot, so it does not scope
+# aicore_freq as an input.
 components:
-  - component: npu
-    interval: 3s
-    metrics:
-      - name: aicore_freq
-        priority: High
   - component: nputurbo
     metrics:
       - name: boost_active

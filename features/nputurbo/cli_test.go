@@ -6,13 +6,10 @@ import (
 	"errors"
 	"strings"
 	"testing"
-
-	"github.com/Computing-Availability-Tools/CATMonitor/internal/collector"
 )
 
 func TestRunOnceForcesDryRun(t *testing.T) {
 	dir := t.TempDir()
-	writeNpuSnapshot(t, dir, []collector.Metric{npuFreqMetric(1, 1700)})
 	tb := &fakeTurbo{}
 	act := NewActuator(tb, injectCmd, cleanCmd, nil)
 	cfg := testConfig(dir)
@@ -32,8 +29,9 @@ func TestRunOnceForcesDryRun(t *testing.T) {
 	if !strings.Contains(out, "nputurbo") {
 		t.Errorf("FormatSnapshot missing header: %q", out)
 	}
-	if !strings.Contains(out, "id=1") || !strings.Contains(out, "1850") {
-		t.Errorf("FormatSnapshot missing plan row (id=1 B=1850): %q", out)
+	// Fixed A=1800, score 1.1 → min(1800*1.1,1900)=1900 (cap). Row shows A=1800 B=1900.
+	if !strings.Contains(out, "id=1") || !strings.Contains(out, "B=1900") {
+		t.Errorf("FormatSnapshot missing plan row (id=1 B=1900): %q", out)
 	}
 	if !strings.Contains(out, "would_boost=true") {
 		t.Errorf("FormatSnapshot missing would_boost=true: %q", out)
@@ -42,7 +40,6 @@ func TestRunOnceForcesDryRun(t *testing.T) {
 
 func TestRunOnceEmptyList(t *testing.T) {
 	dir := t.TempDir()
-	writeNpuSnapshot(t, dir, []collector.Metric{npuFreqMetric(1, 1700)})
 	tb := &fakeTurbo{}
 	act := NewActuator(tb, injectCmd, cleanCmd, nil)
 	cfg := testConfig(dir)
@@ -62,7 +59,6 @@ func TestRunOnceEmptyList(t *testing.T) {
 
 func TestRunOnceStragglerFailureReportsError(t *testing.T) {
 	dir := t.TempDir()
-	writeNpuSnapshot(t, dir, []collector.Metric{npuFreqMetric(1, 1700)})
 	tb := &fakeTurbo{}
 	act := NewActuator(tb, injectCmd, cleanCmd, nil)
 	cfg := testConfig(dir)

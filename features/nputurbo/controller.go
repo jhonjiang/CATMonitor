@@ -7,14 +7,17 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
-	"path/filepath"
-	"strconv"
 	"time"
 
-	"github.com/Computing-Availability-Tools/CATMonitor/features/snapshot"
 	"github.com/Computing-Availability-Tools/CATMonitor/internal/collector"
 	"github.com/Computing-Availability-Tools/CATMonitor/internal/metrics"
 )
+
+// fixedCurrentMHz is the fixed baseline current frequency A used in the
+// boost formula. nputurbo no longer queries aicore_freq from snapshot_npu.json;
+// A is this constant (1800). The formula B = roundStep(min(A*score, M), step)
+// is unchanged — only the source of A changed (snapshot → constant).
+const fixedCurrentMHz = 1800
 
 // Config holds the controller tunables (mapped from config.NputurboConfig by
 // the caller in cmd/catmonitor).
@@ -29,7 +32,6 @@ type Config struct {
 	StepMhz           int
 	DryRun            bool
 	RestoreOnShutdown bool
-	SnapshotDir       string
 	Logger            *slog.Logger
 }
 
@@ -101,15 +103,11 @@ func (c *Controller) Restore() {
 
 // tick is exported for tests; it runs one control cycle.
 func (c *Controller) tick(now time.Time) {
-	if c.cfg.SnapshotDir == "" {
-		c.logger.Warn("nputurbo: snapshot dir not set; cannot read aicore_freq; no-op")
-		return
-	}
-	// planBoosts runs straggler + parse + read snapshot freqs + compute B
-	// per card (no actuation). On straggler/parse failure it returns err
-	// → complete no-op: we have no fresh list to reconcile against, so the
-	// previously-boosted state is left untouched (not restored).
-	_, rows, _, err := c.planBoosts()
+	// planBoosts runs straggler + parse + compute B per card (no actuation).
+	// On straggler/parse failure it returns err → complete no-op: we have no
+	// fresh list to reconcile against, so the previously-boosted state is left
+	// untouched (not restored).
+	_, rows, err := c.planBoosts()
 	if err != nil {
 		c.logger.Error("nputurbo: plan failed; no-op this cycle", "error", err)
 		return
@@ -176,35 +174,30 @@ func (c *Controller) tick(now time.Time) {
 	c.emitMetrics(now)
 }
 
-// planBoosts runs straggler + parse + read snapshot freqs + compute B per
-// card. It does NOT actuate. Returns the parsed cards, per-card plan rows,
-// and the freqs map. On straggler/parse failure returns err (caller no-ops).
-// Shared by tick (which then actuates) and RunOnce (CLI preview, which does not).
-func (c *Controller) planBoosts() (cards []SlowCard, rows []BoostRow, freqs map[int]int, err error) {
+// planBoosts runs straggler + parse + compute B per card. It does NOT actuate.
+// Returns the parsed cards and per-card plan rows. On straggler/parse failure
+// returns err (caller no-ops). Shared by tick (which then actuates) and RunOnce
+// (CLI preview, which does not). A is the fixed fixedCurrentMHz (1800); the
+// slow card's aicore_freq is NOT queried from snapshot.
+func (c *Controller) planBoosts() (cards []SlowCard, rows []BoostRow, err error) {
 	sctx, scancel := context.WithTimeout(context.Background(), c.stragglerTimeout())
 	defer scancel()
 	if err := c.stragg.Run(sctx, c.cfg.StragglerCmd, c.cfg.ResultPath); err != nil {
-		return nil, nil, nil, fmt.Errorf("straggler run: %w", err)
+		return nil, nil, fmt.Errorf("straggler run: %w", err)
 	}
 	data, rerr := os.ReadFile(c.cfg.ResultPath)
 	if rerr != nil {
-		return nil, nil, nil, fmt.Errorf("read result %s: %w", c.cfg.ResultPath, rerr)
+		return nil, nil, fmt.Errorf("read result %s: %w", c.cfg.ResultPath, rerr)
 	}
 	cards, perr := ParseSlowCards(data)
 	if perr != nil {
-		return nil, nil, nil, fmt.Errorf("parse: %w", perr)
+		return nil, nil, fmt.Errorf("parse: %w", perr)
 	}
-	freqs = readAicoreFreqs(c.cfg.SnapshotDir)
 	for _, sc := range cards {
-		a, ok := freqs[sc.ID]
-		if !ok {
-			c.logger.Warn("nputurbo: no aicore_freq in snapshot for card; skip", "id", sc.ID)
-			continue
-		}
-		b, okB := ComputeTargetB(a, sc.Score, c.cfg.MaxFreqMhz, c.cfg.StepMhz)
-		rows = append(rows, BoostRow{ID: sc.ID, A: a, B: b, Score: sc.Score, WouldBoost: okB})
+		b, okB := ComputeTargetB(fixedCurrentMHz, sc.Score, c.cfg.MaxFreqMhz, c.cfg.StepMhz)
+		rows = append(rows, BoostRow{ID: sc.ID, A: fixedCurrentMHz, B: b, Score: sc.Score, WouldBoost: okB})
 	}
-	return cards, rows, freqs, nil
+	return cards, rows, nil
 }
 
 func (c *Controller) stragglerTimeout() time.Duration {
@@ -219,23 +212,6 @@ func (c *Controller) npuTurboTimeout() time.Duration {
 		return c.cfg.NpuTurboTimeout
 	}
 	return 10 * time.Second
-}
-
-// readAicoreFreqs reads snapshot_npu.json and returns map[npu_id]aicore_freq.
-func readAicoreFreqs(snapshotDir string) map[int]int {
-	out := map[int]int{}
-	cs, err := snapshot.ReadComp(filepath.Join(snapshotDir, "snapshot_npu.json"))
-	if err != nil {
-		return out
-	}
-	for _, m := range cs.Metrics {
-		if m.Component == "npu" && m.Name == "aicore_freq" && m.Labels != nil {
-			if id, err := strconv.Atoi(m.Labels["npu_id"]); err == nil {
-				out[id] = int(m.Value)
-			}
-		}
-	}
-	return out
 }
 
 // emitMetrics builds nputurbo.* state metrics, applies the catalog filter,

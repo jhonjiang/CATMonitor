@@ -10,7 +10,7 @@ import (
 // BoostRow is one card's computed boost plan (no actuation).
 type BoostRow struct {
 	ID         int
-	A          int // current freq (MHz, read from snapshot)
+	A          int // baseline current freq (MHz, fixed 1800 — not read from snapshot)
 	B          int // target freq (MHz, =round50(min(A*score,M)))
 	Score      float64
 	WouldBoost bool // false if score<=1 or gain wiped by step quantization
@@ -25,13 +25,13 @@ type Snapshot struct {
 }
 
 // RunOnce is the `catmonitor nputurbo` one-shot: run straggler once, parse,
-// read snapshot freqs, compute each card's target B, and return a printable
-// plan. Forces DryRun=true; never actuates. For actuation, run the daemon
-// with nputurbo.enabled: true + dry_run: false.
+// compute each card's target B from the fixed baseline A=1800, and return a
+// printable plan. Forces DryRun=true; never actuates. For actuation, run the
+// daemon with nputurbo.enabled: true + dry_run: false.
 func RunOnce(cfg Config, stragg StragglerSource, actuator *Actuator) Snapshot {
 	cfg.DryRun = true
 	c := NewController(cfg, stragg, actuator, nil)
-	_, rows, _, err := c.planBoosts()
+	_, rows, err := c.planBoosts()
 	return Snapshot{Rows: rows, DryRun: true, ActuatorOK: actuator.Available(), PlanErr: err}
 }
 

@@ -16,14 +16,14 @@
 Controller.tick (interval):
   straggler.Run(straggler_cmd, result_path)     # exec straggler, 写 result_path
     → 读 result_path(jsonl) → ParseSlowCards    # 详见 §3
-    → readAicoreFreqs(snapshot_npu.json)         # 读每卡当前 A(MHz)
+    → A = fixedCurrentMHz = 1800(常量,不读快照)  # 每卡基线 A(MHz)
     → 对齐 desired state (id -> B):
         有卡恢复(曾 boost 且不在清单) → clean(恢复全部) + 重新 inject 所有 desired
         无卡恢复 → 仅 inject 新卡 / B 变化的卡(幂等,稳定卡不动)
   emitMetrics → sink(/metrics + snapshot_nputurbo.json + jsonl)
 ```
 
-依赖:`internal/source/straggler`(exec straggler)、`internal/source/npu_turbo`(exec inject / clean)、`features/snapshot`(读 snapshot_npu.json)、`internal/metrics`(Filter)。
+依赖:`internal/source/straggler`(exec straggler)、`internal/source/npu_turbo`(exec inject / clean)、`internal/metrics`(Filter)。**不再依赖 `features/snapshot`**——A 是固定常量 1800,不读 `snapshot_npu.json`。
 
 ## 3. 输入获取(straggler)
 
@@ -45,17 +45,17 @@ straggler 写法可能是"一行整份 profiler doc"或"整文件一整份 JSON(
 {"profiler":{"node_result":[{"hostname":"work4","npu":[{"id":1,"cal":{"score":1.234}}]}],"comm_domain_result":{}}}
 ```
 
-展平:遍历 `node_result` 每 node → 遍历 `node.npu` 每卡 → `SlowCard{Hostname, ID, Score}`。hostname **不过滤**(全部纳入,假定文件为单节点或运行方按节点部署);`id` 本地不存在 → 警告并跳过。`id` → NPU card id(对齐 `aicore_freq` 的 `npu_id` 标签 = `cardID`,`dev=0`)。
+展平:遍历 `node_result` 每 node → 遍历 `node.npu` 每卡 → `SlowCard{Hostname, ID, Score}`。hostname **不过滤**(全部纳入,假定文件为单节点或运行方按节点部署)。`id` → NPU card id(仅用于 inject `-n <id>`;A 已不依赖 `aicore_freq` 的 `npu_id` 对齐)。
 
 ## 5. 公式
 
 `B = round_step(min(A × score, M), step=50)`(四舍五入到 50MHz,ties go up)。
 
-- `A` = 该卡当前 `aicore_freq`(MHz,从 `snapshot_npu.json` 读)。
-- `M` = 配置 `max_freq_mhz`(默认 **1900**,常量,不查 DCMI)。
+- `A` = **固定 1800 MHz**(常量 `fixedCurrentMHz`,不再读 `snapshot_npu.json` 的 `aicore_freq`)。公式形态不变,仅 A 的来源由"快照查询"改为"常量"。
+- `M` = 配置 `max_freq_mhz`(默认 **1900**,常量,不查 DCMI)。当 `score` 使 `A×score > M`(对 A=1800 即 `score > 1900/1800 ≈ 1.056`)时 B 被 M 封顶。
 - `step_mhz` = 50。
 - `score ≤ 1` → 跳过(straggler 只记慢卡,正常不会出现)。
-- `B ≤ A`(增益 <25MHz 被取整抹平)→ 跳过(无意义升频)。
+- `B ≤ A`(增益 <25MHz 被取整抹平,或 B 被 M 封顶到 ≤ A)→ 跳过(无意义升频)。
 - `B ≥ M` → 用 M。
 
 ## 6. 执行器(actuator)
@@ -100,15 +100,15 @@ nputurbo:
   restore_on_shutdown: true
 ```
 
-`{path}/{id}/{freq}` 都 `strings.ReplaceAll` 替换;真实命令换参数名只改配置。启用前置:`snapshot.enabled: true`(读 A 需要),否则 warn + no-op(镜像 energysave)。建议把 `nputurbo` 加入 `features:` 列表,使其 `metrics.yaml` 把 `npu.aicore_freq` 带入采集范围(否则当 `features` 非空时 aicore_freq 可能被过滤出 snapshot)。
+`{path}/{id}/{freq}` 都 `strings.ReplaceAll` 替换;真实命令换参数名只改配置。启用前置:无(`snapshot.enabled` 已不再是前置——A 是固定常量 1800,不读快照)。建议把 `nputurbo` 加入 `features:` 列表,使其 `metrics.yaml` 把 `nputurbo` 组件指标带入采集范围。
 
 ## 9. 指标(feature-scoped)
 
-`features/nputurbo/metrics.yaml` 声明:`npu.aicore_freq`(输入)+ `nputurbo` 组件(`boost_active`/`boost_count`/`actuator_ok`,均 High)。写 `sink` → 经 `PerCompWriter` 落 `snapshot_nputurbo.json`,经 `CachingStorage` 进 `/metrics`。`configs/metrics.yaml` 手加 `nputurbo` 组件段(`gen_metrics_catalog.py` 不覆盖特性产出指标,手维护)。
+`features/nputurbo/metrics.yaml` 声明 `nputurbo` 组件(`boost_active`/`boost_count`/`actuator_ok`,均 High)。写 `sink` → 经 `PerCompWriter` 落 `snapshot_nputurbo.json`,经 `CachingStorage` 进 `/metrics`。`configs/metrics.yaml` 手加 `nputurbo` 组件段(`gen_metrics_catalog.py` 不覆盖特性产出指标,手维护)。注:不再声明 `npu.aicore_freq` 为输入(A 已固定,不读快照)。
 
 ## 10. CLI
 
-`catmonitor nputurbo` — 读 `result_path` + `snapshot_npu.json`,算 B,打印每卡 `id/A/score/B/would_boost`,**强制 dry-run 不 exec inject/clean**(镜像 energysave CLI)。actuate 走 daemon `enabled: true` + `dry_run: false`。
+`catmonitor nputurbo` — 读 `result_path`,以固定 A=1800 算 B,打印每卡 `id/A/score/B/would_boost`,**强制 dry-run 不 exec inject/clean**(镜像 energysave CLI)。actuate 走 daemon `enabled: true` + `dry_run: false`。
 
 ## 11. 测试
 
@@ -116,7 +116,7 @@ nputurbo:
 - `features/nputurbo/input_test.go`:jsonl fixture 覆盖——单行整 doc、pretty-print 整 doc、多行追加(取末行)、`node_result` 空、多 node 多卡、坏行跳过、全坏返回 error。
 - `features/nputurbo/formula_test.go`:边界(`A×score>M` 截断、取整 50 边界、`B≤A` 跳过、`score≤1` 跳过)。
 - `features/nputurbo/actuator_test.go`:inject 成功记 lastApplied、inject 失败置 Ok=false 不更新、clean 清空 lastApplied、clean 失败保留状态、`Available` 检查 inject 二进制。
-- `features/nputurbo/controller_test.go`:boost 多卡(无 clean)、清单内消失卡 → clean+reinject、`node_result` 空 → clean、score 变化 → 仅 reinject 不 clean、新卡出现 → 仅 inject 不 clean、dry_run 不 exec、straggler 失败完全 no-op(不动已 boost 状态)。
+- `features/nputurbo/controller_test.go`:boost 多卡(无 clean)、清单内消失卡 → clean+reinject、`node_result` 空 → clean、score 变化但 B 不变(封顶)→ 幂等不 reinject、新卡出现 → 仅 inject 不 clean、dry_run 不 exec、straggler 失败完全 no-op(不动已 boost 状态)。
 - `features/nputurbo/cli_test.go`:`RunOnce` 强制 dry-run、空清单、straggler 失败报错。
 - 平台签名同步:`GOOS=windows go build ./cmd/catmonitor`(现有交叉编译检查覆盖)。
 - 运行:`make lint && make test`(无 NPU/GPU 环境 mock + 优雅降级,项目既有约定)。
@@ -124,7 +124,7 @@ nputurbo:
 ## 12. 不做 / 已知限制
 
 - 不改 `features/stragglerout/`(无关)。
-- 不查 DCMI(A 走 snapshot;若 `snapshot.enabled=false` warn + no-op)。
-- `aicore_freq` 需在 nputurbo 的 feature scope 内(否则当 `features` 非空时 `metrics.Filter` 把它从 snapshot 过滤掉 → 读不到 → 跳过该卡)。建议启用时把 `nputurbo` 加入 `features:` 列表。
+- 不查 DCMI(A 是固定常量 1800,不读快照、不查 DCMI)。
+- 不再依赖 `snapshot.enabled`:A 固定后 nputurbo 无需读 `snapshot_npu.json`;`npu.aicore_freq` 也不必在 nputurbo 的 feature scope 内(A 不从快照取)。建议仍把 `nputurbo` 加入 `features:` 列表以带入 `nputurbo` 组件指标。
 - 不处理 `score≤1`(straggler 只记慢卡)。
 - clean 是 all-or-nothing:单卡恢复会连带 clean 仍慢的卡再重新 inject(可接受;若未来工具支持按卡 clean,可回到按卡 restore 以消除抖动)。
