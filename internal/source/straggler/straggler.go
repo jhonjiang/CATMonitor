@@ -1,61 +1,73 @@
-// Package straggler provides an exec source that runs the external
-// `straggler` slow-node detector, which writes its slow-card result to a
-// path given via the `path=` argument. Mirrors the npu_smi exec-source
-// pattern: singleton, runner seam for tests, graceful Available()==false
-// when the binary is missing.
+// Package straggler provides an HTTP source that fetches the external
+// straggler slow-node detector's result via HTTP GET. The endpoint URL is
+// supplied by the caller (controller's cfg.StragglerURL); this source is a
+// pure transport — it returns the response body and does not parse it
+// (parsing stays in features/nputurbo.ParseSlowCards). Mirrors the npu_smi
+// source pattern: singleton, fetcher seam for tests, graceful error return
+// on non-2xx / timeout / network failure.
 package straggler
 
 import (
 	"context"
-	"os/exec"
-	"strings"
+	"fmt"
+	"io"
+	"net/http"
 	"sync"
 )
 
-// Source runs the straggler detector.
+// Source fetches the straggler slow-card result over HTTP.
 type Source interface {
-	Available() bool
-	Run(ctx context.Context, cmdTemplate, resultPath string) error
+	Fetch(ctx context.Context, url string) ([]byte, error)
 }
 
-type runner = func(ctx context.Context, cmd string) error
+type fetcher = func(ctx context.Context, url string) ([]byte, error)
 
-func realRun(ctx context.Context, cmd string) error {
-	return exec.CommandContext(ctx, "sh", "-c", cmd).Run()
+func realFetch(ctx context.Context, url string) ([]byte, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, fmt.Errorf("straggler fetch: build request: %w", err)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("straggler fetch: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("straggler fetch: HTTP %d", resp.StatusCode)
+	}
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("straggler fetch: read body: %w", err)
+	}
+	return body, nil
 }
 
 type defaultSource struct {
-	runner runner
+	fetcher fetcher
 }
 
 var (
-	defaultSrc = &defaultSource{runner: realRun}
+	defaultSrc = &defaultSource{fetcher: realFetch}
 	mu         sync.Mutex
 )
 
 func Default() Source { return defaultSrc }
 
-func SetMock(fn func(ctx context.Context, cmd string) error) {
+func SetMock(fn func(ctx context.Context, url string) ([]byte, error)) {
 	mu.Lock()
 	defer mu.Unlock()
-	defaultSrc.runner = fn
+	defaultSrc.fetcher = fn
 }
 
-func ResetRunner() {
+func ResetMock() {
 	mu.Lock()
 	defer mu.Unlock()
-	defaultSrc.runner = realRun
+	defaultSrc.fetcher = realFetch
 }
 
-func (s *defaultSource) Available() bool {
-	_, err := exec.LookPath("straggler")
-	return err == nil
-}
-
-func (s *defaultSource) Run(ctx context.Context, cmdTemplate, resultPath string) error {
-	cmd := strings.ReplaceAll(cmdTemplate, "{path}", resultPath)
+func (s *defaultSource) Fetch(ctx context.Context, url string) ([]byte, error) {
 	mu.Lock()
-	r := s.runner
+	f := s.fetcher
 	mu.Unlock()
-	return r(ctx, cmd)
+	return f(ctx, url)
 }

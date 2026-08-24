@@ -22,8 +22,7 @@ var nputurboCtl *nputurbo.Controller
 func toNputurboConfig(cfg *config.Config, logger *slog.Logger) nputurbo.Config {
 	return nputurbo.Config{
 		Interval:          cfg.Nputurbo.Interval,
-		StragglerCmd:      cfg.Nputurbo.StragglerCmd,
-		ResultPath:        cfg.Nputurbo.ResultPath,
+		StragglerURL:      cfg.Nputurbo.StragglerURL,
 		StragglerTimeout:  cfg.Nputurbo.StragglerTimeout,
 		NpuTurboCmd:       cfg.Nputurbo.NpuTurboCmd,
 		NpuTurboTimeout:   cfg.Nputurbo.NpuTurboTimeout,
@@ -35,15 +34,18 @@ func toNputurboConfig(cfg *config.Config, logger *slog.Logger) nputurbo.Config {
 	}
 }
 
-// startNputurbo starts the nputurbo controller, which runs the straggler
-// detector at cfg.Nputurbo.Interval, computes each slow card's target B from
-// the fixed baseline A=1800 (aicore_freq is NOT queried from snapshot), and
-// execs /var/npu_turbo to boost. No-op when cfg.Nputurbo.Enabled is false.
-// nputurbo.* state metrics are written to sink (the storage chain end) so they
-// surface in /metrics + snapshot_nputurbo.json + jsonl like collector-produced
-// metrics.
+// startNputurbo starts the nputurbo controller, which periodically HTTP GETs
+// straggler_url for the slow-card result, computes each slow card's target B
+// from the fixed baseline A=1800, and execs /var/npu_turbo to boost. No-op when
+// cfg.Nputurbo.Enabled is false or straggler_url is empty. nputurbo.* state
+// metrics are written to sink (the storage chain end) so they surface in
+// /metrics + snapshot_nputurbo.json + jsonl like collector-produced metrics.
 func startNputurbo(ctx context.Context, cfg *config.Config, sink collector.Storage, logger *slog.Logger) {
 	if !cfg.Nputurbo.Enabled {
+		return
+	}
+	if cfg.Nputurbo.StragglerURL == "" {
+		logger.Error("nputurbo enabled but straggler_url is empty; not starting")
 		return
 	}
 	act := nputurbo.NewActuator(npu_turbo.Default(), cfg.Nputurbo.NpuTurboCmd, cfg.Nputurbo.NpuTurboCleanCmd, logger)
@@ -60,9 +62,9 @@ func stopNputurbo() {
 	}
 }
 
-// runNputurboCLI is the `catmonitor nputurbo` one-shot: run straggler once,
-// compute each slow card's target B from the fixed baseline A=1800, and print
-// a read-only plan. Never execs npu_turbo (forces DryRun=true).
+// runNputurboCLI is the `catmonitor nputurbo` one-shot: HTTP GET straggler_url
+// once, compute each slow card's target B from the fixed baseline A=1800, and
+// print a read-only plan. Never execs npu_turbo (forces DryRun=true).
 func runNputurboCLI(cfg *config.Config, logger *slog.Logger) {
 	act := nputurbo.NewActuator(npu_turbo.Default(), cfg.Nputurbo.NpuTurboCmd, cfg.Nputurbo.NpuTurboCleanCmd, logger)
 	snap := nputurbo.RunOnce(toNputurboConfig(cfg, logger), straggler.Default(), act)

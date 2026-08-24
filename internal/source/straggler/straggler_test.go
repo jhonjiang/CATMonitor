@@ -2,36 +2,66 @@ package straggler
 
 import (
 	"context"
-	"errors"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 )
 
-func TestRunSubstitutesPathAndInvokesRunner(t *testing.T) {
-	var got string
-	SetMock(func(ctx context.Context, cmd string) error { got = cmd; return nil })
-	defer ResetRunner()
-	if err := Default().Run(context.Background(), "straggler path={path}", "/tmp/r.jsonl"); err != nil {
-		t.Fatalf("Run: %v", err)
+func TestFetchReturnsBodyOn200(t *testing.T) {
+	want := `{"profiler":{"node_result":[]},"kpi":{}}`
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			t.Errorf("method: got %q want GET", r.Method)
+		}
+		_, _ = io.WriteString(w, want)
+	}))
+	defer srv.Close()
+	body, err := Default().Fetch(context.Background(), srv.URL)
+	if err != nil {
+		t.Fatalf("Fetch: %v", err)
 	}
-	want := "straggler path=/tmp/r.jsonl"
-	if got != want {
-		t.Errorf("cmd: got %q want %q", got, want)
-	}
-}
-
-func TestRunPropagatesError(t *testing.T) {
-	SetMock(func(ctx context.Context, cmd string) error { return errors.New("exit 1") })
-	defer ResetRunner()
-	err := Default().Run(context.Background(), "straggler path={path}", "/x")
-	if err == nil || !strings.Contains(err.Error(), "exit 1") {
-		t.Fatalf("expected propagated error, got %v", err)
+	if string(body) != want {
+		t.Errorf("body: got %q want %q", string(body), want)
 	}
 }
 
-func TestAvailableDoesNotPanic(t *testing.T) {
-	// straggler is almost certainly not on PATH in dev/CI → false is the
-	// expected graceful-degradation value; just assert it returns a bool
-	// without panicking.
-	_ = Default().Available()
+func TestFetchErrorOnNon2xx(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer srv.Close()
+	_, err := Default().Fetch(context.Background(), srv.URL)
+	if err == nil {
+		t.Fatal("expected error on 500, got nil")
+	}
+}
+
+func TestFetchTimeoutOnSlowServer(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(200 * time.Millisecond)
+	}))
+	defer srv.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	_, err := Default().Fetch(ctx, srv.URL)
+	if err == nil {
+		t.Fatal("expected timeout error, got nil")
+	}
+}
+
+func TestSetMockOverride(t *testing.T) {
+	SetMock(func(ctx context.Context, url string) ([]byte, error) {
+		return []byte("mocked:" + url), nil
+	})
+	defer ResetMock()
+	body, err := Default().Fetch(context.Background(), "http://x")
+	if err != nil {
+		t.Fatalf("Fetch: %v", err)
+	}
+	if !strings.HasPrefix(string(body), "mocked:") {
+		t.Errorf("got %q", string(body))
+	}
 }

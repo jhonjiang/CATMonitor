@@ -9,10 +9,9 @@ import (
 )
 
 func TestRunOnceForcesDryRun(t *testing.T) {
-	dir := t.TempDir()
 	tb := &fakeTurbo{}
 	act := NewActuator(tb, injectCmd, cleanCmd, nil)
-	cfg := testConfig(dir)
+	cfg := testConfig()
 	cfg.DryRun = false // RunOnce must override to true
 	stragg := &fakeStraggler{payload: []byte(`{"profiler":{"node_result":[{"hostname":"h","npu":[{"id":1,"cal":{"score":1.1}}]}],"comm_domain_result":{}}}`)}
 	snap := RunOnce(cfg, stragg, act)
@@ -39,10 +38,9 @@ func TestRunOnceForcesDryRun(t *testing.T) {
 }
 
 func TestRunOnceEmptyList(t *testing.T) {
-	dir := t.TempDir()
 	tb := &fakeTurbo{}
 	act := NewActuator(tb, injectCmd, cleanCmd, nil)
-	cfg := testConfig(dir)
+	cfg := testConfig()
 	stragg := &fakeStraggler{payload: []byte(`{"profiler":{"node_result":[],"comm_domain_result":{}}}`)}
 	snap := RunOnce(cfg, stragg, act)
 	if snap.PlanErr != nil {
@@ -58,11 +56,10 @@ func TestRunOnceEmptyList(t *testing.T) {
 }
 
 func TestRunOnceStragglerFailureReportsError(t *testing.T) {
-	dir := t.TempDir()
 	tb := &fakeTurbo{}
 	act := NewActuator(tb, injectCmd, cleanCmd, nil)
-	cfg := testConfig(dir)
-	stragg := &fakeStraggler{err: errors.New("straggler exec failed")}
+	cfg := testConfig()
+	stragg := &fakeStraggler{err: errors.New("straggler fetch failed")}
 	snap := RunOnce(cfg, stragg, act)
 	if snap.PlanErr == nil {
 		t.Error("expected PlanErr on straggler failure")

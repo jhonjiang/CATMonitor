@@ -6,7 +6,6 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
-	"os"
 	"time"
 
 	"github.com/Computing-Availability-Tools/CATMonitor/internal/collector"
@@ -23,8 +22,7 @@ const fixedCurrentMHz = 1800
 // the caller in cmd/catmonitor).
 type Config struct {
 	Interval          time.Duration
-	StragglerCmd      string
-	ResultPath        string
+	StragglerURL      string
 	StragglerTimeout  time.Duration
 	NpuTurboCmd       string
 	NpuTurboTimeout   time.Duration
@@ -41,17 +39,17 @@ type Storage interface {
 	Write(ms []collector.Metric) error
 }
 
-// StragglerSource is the seam for the straggler exec source (real =
-// straggler.Default(); tests inject a fake).
+// StragglerSource is the seam for the straggler HTTP source (real =
+// straggler.Default(); tests inject a fake). Fetch returns the slow-card
+// detection result body; parsing stays in ParseSlowCards.
 type StragglerSource interface {
-	Available() bool
-	Run(ctx context.Context, cmdTemplate, resultPath string) error
+	Fetch(ctx context.Context, url string) ([]byte, error)
 }
 
-// Controller is the nputurbo control loop. Each tick it runs the straggler
-// detector to refresh the slow-card result file, parses it, reads current
-// AICore frequencies from snapshot_npu.json, reconciles the boosted set
-// (restore disappeared, boost listed), and emits state metrics.
+// Controller is the nputurbo control loop. Each tick it fetches the straggler
+// slow-card result over HTTP (GET straggler_url), parses it, computes target
+// freqs from the fixed baseline A=1800, reconciles the boosted set (restore
+// disappeared, boost listed), and emits state metrics.
 type Controller struct {
 	cfg      Config
 	stragg   StragglerSource
@@ -76,7 +74,7 @@ func (c *Controller) Run(ctx context.Context) {
 	}
 	c.logger.Info("nputurbo controller started",
 		"interval", c.cfg.Interval, "dry_run", c.cfg.DryRun,
-		"straggler_cmd", c.cfg.StragglerCmd, "result_path", c.cfg.ResultPath)
+		"straggler_url", c.cfg.StragglerURL)
 	t := time.NewTicker(c.cfg.Interval)
 	defer t.Stop()
 	for {
@@ -120,7 +118,7 @@ func (c *Controller) tick(now time.Time) {
 		}
 	}
 	c.logger.Info("nputurbo: straggler tick",
-		"slow_cards", len(rows), "would_boost", len(desired), "result_path", c.cfg.ResultPath)
+		"slow_cards", len(rows), "would_boost", len(desired), "straggler_url", c.cfg.StragglerURL)
 	if c.cfg.DryRun {
 		for _, r := range rows {
 			if r.WouldBoost {
@@ -174,20 +172,17 @@ func (c *Controller) tick(now time.Time) {
 	c.emitMetrics(now)
 }
 
-// planBoosts runs straggler + parse + compute B per card. It does NOT actuate.
-// Returns the parsed cards and per-card plan rows. On straggler/parse failure
-// returns err (caller no-ops). Shared by tick (which then actuates) and RunOnce
-// (CLI preview, which does not). A is the fixed fixedCurrentMHz (1800); the
-// slow card's aicore_freq is NOT queried from snapshot.
+// planBoosts runs straggler fetch + parse + compute B per card. It does NOT
+// actuate. Returns the parsed cards and per-card plan rows. On fetch/parse
+// failure returns err (caller no-ops). Shared by tick (which then actuates)
+// and RunOnce (CLI preview, which does not). A is the fixed fixedCurrentMHz
+// (1800); the slow card's aicore_freq is NOT queried from snapshot.
 func (c *Controller) planBoosts() (cards []SlowCard, rows []BoostRow, err error) {
 	sctx, scancel := context.WithTimeout(context.Background(), c.stragglerTimeout())
 	defer scancel()
-	if err := c.stragg.Run(sctx, c.cfg.StragglerCmd, c.cfg.ResultPath); err != nil {
-		return nil, nil, fmt.Errorf("straggler run: %w", err)
-	}
-	data, rerr := os.ReadFile(c.cfg.ResultPath)
-	if rerr != nil {
-		return nil, nil, fmt.Errorf("read result %s: %w", c.cfg.ResultPath, rerr)
+	data, ferr := c.stragg.Fetch(sctx, c.cfg.StragglerURL)
+	if ferr != nil {
+		return nil, nil, fmt.Errorf("straggler fetch: %w", ferr)
 	}
 	cards, perr := ParseSlowCards(data)
 	if perr != nil {
@@ -211,7 +206,7 @@ func (c *Controller) npuTurboTimeout() time.Duration {
 	if c.cfg.NpuTurboTimeout > 0 {
 		return c.cfg.NpuTurboTimeout
 	}
-	return 10 * time.Second
+	return 120 * time.Second
 }
 
 // emitMetrics builds nputurbo.* state metrics, applies the catalog filter,

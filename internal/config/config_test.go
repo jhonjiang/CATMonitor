@@ -1,6 +1,9 @@
 package config
 
-import "testing"
+import (
+	"testing"
+	"time"
+)
 
 func TestDefaultNputurboConfig(t *testing.T) {
 	cfg := Default()
@@ -24,5 +27,11 @@ func TestDefaultNputurboConfig(t *testing.T) {
 	}
 	if cfg.Nputurbo.NpuTurboCleanCmd != "/home/jw/npu_turbo_one.sh clean" {
 		t.Errorf("Nputurbo.NpuTurboCleanCmd = %q", cfg.Nputurbo.NpuTurboCleanCmd)
+	}
+	if cfg.Nputurbo.StragglerURL != "" {
+		t.Errorf("Nputurbo.StragglerURL = %q, want empty default", cfg.Nputurbo.StragglerURL)
+	}
+	if cfg.Nputurbo.StragglerTimeout != 10*time.Second {
+		t.Errorf("Nputurbo.StragglerTimeout = %v, want 10s", cfg.Nputurbo.StragglerTimeout)
 	}
 }

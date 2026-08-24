@@ -5,29 +5,25 @@ package nputurbo
 import (
 	"context"
 	"errors"
-	"os"
-	"path/filepath"
 	"testing"
 	"time"
 )
 
-// fakeStraggler implements StragglerSource; on Run it writes payload to
-// resultPath (simulating the real straggler writing its result file), or
-// returns err to simulate a straggler exec failure.
+// fakeStraggler implements StragglerSource; on Fetch it returns payload
+// (simulating the HTTP endpoint's response body), or returns err to simulate
+// an HTTP failure (non-2xx / timeout / network).
 type fakeStraggler struct {
 	payload []byte
 	err     error
 }
 
-func (f *fakeStraggler) Available() bool { return true }
-
-func (f *fakeStraggler) Run(ctx context.Context, cmdTemplate, resultPath string) error {
+func (f *fakeStraggler) Fetch(ctx context.Context, url string) ([]byte, error) {
 	_ = ctx
-	_ = cmdTemplate
+	_ = url
 	if f.err != nil {
-		return f.err
+		return nil, f.err
 	}
-	return os.WriteFile(resultPath, f.payload, 0644)
+	return f.payload, nil
 }
 
 const (
@@ -35,10 +31,9 @@ const (
 	cleanCmd  = "/home/jw/npu_turbo_one.sh clean"
 )
 
-func testConfig(dir string) Config {
+func testConfig() Config {
 	return Config{
-		StragglerCmd:     "straggler path={path}",
-		ResultPath:       filepath.Join(dir, "r.jsonl"),
+		StragglerURL:     "http://test.invalid/straggler",
 		StragglerTimeout: 5 * time.Second,
 		NpuTurboTimeout:  5 * time.Second,
 		NpuTurboCmd:      injectCmd,
@@ -49,13 +44,10 @@ func testConfig(dir string) Config {
 }
 
 func TestTickBoostsSlowCards(t *testing.T) {
-	dir := t.TempDir()
 	tb := &fakeTurbo{}
 	act := NewActuator(tb, injectCmd, cleanCmd, nil)
-	// Fixed A=1800: score 1.1 → min(1800*1.1,1900)=1900 (cap); score 1.2 → 1900.
-	// Both cards boost to 1900 (M dominates since 1800*score>1900 for these).
 	payload := []byte(`{"profiler":{"node_result":[{"hostname":"h","npu":[{"id":1,"cal":{"score":1.1}},{"id":3,"cal":{"score":1.2}}]}],"comm_domain_result":{}}}`)
-	c := NewController(testConfig(dir), &fakeStraggler{payload: payload}, act, nil)
+	c := NewController(testConfig(), &fakeStraggler{payload: payload}, act, nil)
 	c.tick(time.Now())
 	if act.LastApplied(1) != 1900 {
 		t.Errorf("card1 expected boosted to 1900, got %d", act.LastApplied(1))
@@ -69,16 +61,15 @@ func TestTickBoostsSlowCards(t *testing.T) {
 }
 
 func TestTickRestoresDisappearedCard(t *testing.T) {
-	dir := t.TempDir()
 	tb := &fakeTurbo{}
 	act := NewActuator(tb, injectCmd, cleanCmd, nil)
 	payload1 := []byte(`{"profiler":{"node_result":[{"hostname":"h","npu":[{"id":1,"cal":{"score":1.1}},{"id":3,"cal":{"score":1.2}}]}],"comm_domain_result":{}}}`)
-	c := NewController(testConfig(dir), &fakeStraggler{payload: payload1}, act, nil)
+	c := NewController(testConfig(), &fakeStraggler{payload: payload1}, act, nil)
 	c.tick(time.Now())
 	// Second tick: card1 disappeared (recovered); card3 still slow.
 	payload2 := []byte(`{"profiler":{"node_result":[{"hostname":"h","npu":[{"id":3,"cal":{"score":1.2}}]}],"comm_domain_result":{}}}`)
 	tbBefore := tb.injectCount()
-	c2 := NewController(testConfig(dir), &fakeStraggler{payload: payload2}, act, nil)
+	c2 := NewController(testConfig(), &fakeStraggler{payload: payload2}, act, nil)
 	c2.tick(time.Now())
 	// Recovery → clean (restore all) + re-inject the still-slow card3.
 	if tb.cleanCount() != 1 {
@@ -96,11 +87,10 @@ func TestTickRestoresDisappearedCard(t *testing.T) {
 }
 
 func TestTickEmptyNodeResultRestoresAll(t *testing.T) {
-	dir := t.TempDir()
 	tb := &fakeTurbo{}
 	act := NewActuator(tb, injectCmd, cleanCmd, nil)
 	payload1 := []byte(`{"profiler":{"node_result":[{"hostname":"h","npu":[{"id":1,"cal":{"score":1.1}}]}],"comm_domain_result":{}}}`)
-	c := NewController(testConfig(dir), &fakeStraggler{payload: payload1}, act, nil)
+	c := NewController(testConfig(), &fakeStraggler{payload: payload1}, act, nil)
 	c.tick(time.Now())
 	if act.LastApplied(1) == 0 {
 		t.Fatal("expected boost first")
@@ -108,7 +98,7 @@ func TestTickEmptyNodeResultRestoresAll(t *testing.T) {
 	// Empty node_result → all recovered → clean, no inject.
 	payload2 := []byte(`{"profiler":{"node_result":[],"comm_domain_result":{}}}`)
 	tbBeforeInject := tb.injectCount()
-	c2 := NewController(testConfig(dir), &fakeStraggler{payload: payload2}, act, nil)
+	c2 := NewController(testConfig(), &fakeStraggler{payload: payload2}, act, nil)
 	c2.tick(time.Now())
 	if tb.cleanCount() != 1 {
 		t.Errorf("expected 1 clean on empty list, got %d", tb.cleanCount())
@@ -122,11 +112,10 @@ func TestTickEmptyNodeResultRestoresAll(t *testing.T) {
 }
 
 func TestTickScoreChangeNoReinject(t *testing.T) {
-	dir := t.TempDir()
 	tb := &fakeTurbo{}
 	act := NewActuator(tb, injectCmd, cleanCmd, nil)
 	// tick1: card1 score=1.1, A=1800 → B=1900 (cap).
-	c := NewController(testConfig(dir), &fakeStraggler{payload: []byte(`{"profiler":{"node_result":[{"hostname":"h","npu":[{"id":1,"cal":{"score":1.1}}]}],"comm_domain_result":{}}}`)}, act, nil)
+	c := NewController(testConfig(), &fakeStraggler{payload: []byte(`{"profiler":{"node_result":[{"hostname":"h","npu":[{"id":1,"cal":{"score":1.1}}]}],"comm_domain_result":{}}}`)}, act, nil)
 	c.tick(time.Now())
 	if act.LastApplied(1) != 1900 {
 		t.Fatalf("tick1: expected 1900, got %d", act.LastApplied(1))
@@ -135,7 +124,7 @@ func TestTickScoreChangeNoReinject(t *testing.T) {
 	// Same B → idempotent, no re-inject, no clean.
 	tbBefore := tb.injectCount()
 	cleanBefore := tb.cleanCount()
-	c2 := NewController(testConfig(dir), &fakeStraggler{payload: []byte(`{"profiler":{"node_result":[{"hostname":"h","npu":[{"id":1,"cal":{"score":1.12}}]}],"comm_domain_result":{}}}`)}, act, nil)
+	c2 := NewController(testConfig(), &fakeStraggler{payload: []byte(`{"profiler":{"node_result":[{"hostname":"h","npu":[{"id":1,"cal":{"score":1.12}}]}],"comm_domain_result":{}}}`)}, act, nil)
 	c2.tick(time.Now())
 	if tb.cleanCount()-cleanBefore != 0 {
 		t.Errorf("no recovery → no clean, got %d cleans", tb.cleanCount()-cleanBefore)
@@ -149,17 +138,16 @@ func TestTickScoreChangeNoReinject(t *testing.T) {
 }
 
 func TestTickNewCardNoClean(t *testing.T) {
-	dir := t.TempDir()
 	tb := &fakeTurbo{}
 	act := NewActuator(tb, injectCmd, cleanCmd, nil)
 	// tick1: only card1 (A=1800, score 1.1 → 1900).
-	c := NewController(testConfig(dir), &fakeStraggler{payload: []byte(`{"profiler":{"node_result":[{"hostname":"h","npu":[{"id":1,"cal":{"score":1.1}}]}],"comm_domain_result":{}}}`)}, act, nil)
+	c := NewController(testConfig(), &fakeStraggler{payload: []byte(`{"profiler":{"node_result":[{"hostname":"h","npu":[{"id":1,"cal":{"score":1.1}}]}],"comm_domain_result":{}}}`)}, act, nil)
 	c.tick(time.Now())
 	// tick2: card1 (unchanged) + new card4 (score 1.2 → 1900). No recovery →
 	// inject only the new card, no clean.
 	tbBefore := tb.injectCount()
 	cleanBefore := tb.cleanCount()
-	c2 := NewController(testConfig(dir), &fakeStraggler{payload: []byte(`{"profiler":{"node_result":[{"hostname":"h","npu":[{"id":1,"cal":{"score":1.1}},{"id":4,"cal":{"score":1.2}}]}],"comm_domain_result":{}}}`)}, act, nil)
+	c2 := NewController(testConfig(), &fakeStraggler{payload: []byte(`{"profiler":{"node_result":[{"hostname":"h","npu":[{"id":1,"cal":{"score":1.1}},{"id":4,"cal":{"score":1.2}}]}],"comm_domain_result":{}}}`)}, act, nil)
 	c2.tick(time.Now())
 	if tb.cleanCount()-cleanBefore != 0 {
 		t.Errorf("no recovery → no clean, got %d cleans", tb.cleanCount()-cleanBefore)
@@ -173,10 +161,9 @@ func TestTickNewCardNoClean(t *testing.T) {
 }
 
 func TestTickDryRunNoExec(t *testing.T) {
-	dir := t.TempDir()
 	tb := &fakeTurbo{}
 	act := NewActuator(tb, injectCmd, cleanCmd, nil)
-	cfg := testConfig(dir)
+	cfg := testConfig()
 	cfg.DryRun = true
 	c := NewController(cfg, &fakeStraggler{payload: []byte(`{"profiler":{"node_result":[{"hostname":"h","npu":[{"id":1,"cal":{"score":1.1}}]}],"comm_domain_result":{}}}`)}, act, nil)
 	c.tick(time.Now())
@@ -189,7 +176,6 @@ func TestTickDryRunNoExec(t *testing.T) {
 }
 
 func TestTickStragglerFailureNoOpsAndDoesNotRestore(t *testing.T) {
-	dir := t.TempDir()
 	tb := &fakeTurbo{}
 	act := NewActuator(tb, injectCmd, cleanCmd, nil)
 	// Pre-boost card1 so we can verify a straggler failure does NOT clean it
@@ -197,7 +183,7 @@ func TestTickStragglerFailureNoOpsAndDoesNotRestore(t *testing.T) {
 	_ = act.Boost(context.Background(), 1, 1900)
 	injectBefore := tb.injectCount()
 	cleanBefore := tb.cleanCount()
-	c := NewController(testConfig(dir), &fakeStraggler{err: errors.New("straggler exec failed")}, act, nil)
+	c := NewController(testConfig(), &fakeStraggler{err: errors.New("straggler exec failed")}, act, nil)
 	c.tick(time.Now())
 	if tb.injectCount()-injectBefore != 0 || tb.cleanCount()-cleanBefore != 0 {
 		t.Errorf("straggler failure should trigger no exec, got %d injects + %d cleans",

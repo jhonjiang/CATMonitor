@@ -14,26 +14,27 @@
 
 ```
 Controller.tick (interval):
-  straggler.Run(straggler_cmd, result_path)     # exec straggler, 写 result_path
-    → 读 result_path(jsonl) → ParseSlowCards    # 详见 §3
-    → A = fixedCurrentMHz = 1800(常量,不读快照)  # 每卡基线 A(MHz)
-    → 对齐 desired state (id -> B):
+  straggler.Fetch(straggler_url)              # HTTP GET → 响应体(profiler doc)
+     → ParseSlowCards(body)                    # 详见 §3、§4
+     → A = fixedCurrentMHz = 1800(常量,不读快照)  # 每卡基线 A(MHz)
+     → 对齐 desired state (id -> B):
         有卡恢复(曾 boost 且不在清单) → clean(恢复全部) + 重新 inject 所有 desired
         无卡恢复 → 仅 inject 新卡 / B 变化的卡(幂等,稳定卡不动)
   emitMetrics → sink(/metrics + snapshot_nputurbo.json + jsonl)
 ```
 
-依赖:`internal/source/straggler`(exec straggler)、`internal/source/npu_turbo`(exec inject / clean)、`internal/metrics`(Filter)。**不再依赖 `features/snapshot`**——A 是固定常量 1800,不读 `snapshot_npu.json`。
+依赖:`internal/source/straggler`(HTTP GET fetch)、`internal/source/npu_turbo`(exec inject / clean)、`internal/metrics`(Filter)。**不再依赖 `features/snapshot`**——A 是固定常量 1800,不读 `snapshot_npu.json`。
 
-## 3. 输入获取(straggler)
+## 3. 输入获取(straggler,HTTP)
 
-控制器每 tick:① exec `straggler path=<result_path>`(带 `straggler_timeout`);② 读 `result_path` 文件(jsonl);③ 解析(§4)。
+控制器每 tick:① HTTP GET `straggler_url`(带 `straggler_timeout`);② `ParseSlowCards` 解析响应体(§4)。响应体格式与原 straggler 输出一致(`profiler.node_result`;顶层 `kpi` 块由 `json.Unmarshal` 自动忽略,§4)。
 
-- exec 失败 / 非零退出 / 超时 → 本周期**完全 no-op**(不调频、**不 clean**——拿不到清单无法对齐 desired state)。
-- exec 成功但文件缺失/全行解析失败 → 完全 no-op。
+- HTTP 失败(超时 / 非 2xx / 网络错 / DNS)→ 本周期**完全 no-op**(不调频、**不 clean**——拿不到清单无法对齐 desired state)。
+- 响应体为空 / 全行解析失败 → 完全 no-op。
 - 解析成功但 `node_result` 为空 list(无慢卡)→ **不 inject**,但按 §7 clean(所有曾 boost 的卡恢复)。
+- `straggler_url` 为空 → nputurbo 不启动(与 `enabled:false` 同效,启动日志报错)。
 
-straggler 是外部命令,与本仓库 `features/stragglerout/` 无关(后者是 KPI 输出,不影响本特性)。
+straggler 接口由 daemon HTTP GET 获取,与本仓库 `features/stragglerout/` 无关(后者是 KPI 输出,不影响本特性)。
 
 ## 4. 解析器(对 jsonl / 单 doc 都健壮)
 
@@ -88,12 +89,11 @@ actuator 暴露两个操作(均经 `internal/source/npu_turbo` exec):
 nputurbo:
   enabled: false
   interval: 60s
-  straggler_cmd: "straggler path={path}"                          # {path} 替换为 result_path
-  result_path: /var/lib/catmonitor/nputurbo/straggler_result.jsonl
-  straggler_timeout: 60s
+  straggler_url: "http://127.0.0.1:8080/straggler/result"   # GET → profiler doc(顶层 kpi 块自动忽略)
+  straggler_timeout: 10s                                    # HTTP GET 超时
   npu_turbo_cmd: "/home/jw/npu_turbo_one.sh inject -n {id} -f {freq}"  # {id}/{freq} 替换
   npu_turbo_clean_cmd: "/home/jw/npu_turbo_one.sh clean"          # 原样执行(恢复全部卡)
-  npu_turbo_timeout: 10s
+  npu_turbo_timeout: 120s
   max_freq_mhz: 1900        # M
   step_mhz: 50              # 取整步长
   dry_run: true             # 默认 judge+log;actuate 需 dry_run: false + root
@@ -126,5 +126,6 @@ nputurbo:
 - 不改 `features/stragglerout/`(无关)。
 - 不查 DCMI(A 是固定常量 1800,不读快照、不查 DCMI)。
 - 不再依赖 `snapshot.enabled`:A 固定后 nputurbo 无需读 `snapshot_npu.json`;`npu.aicore_freq` 也不必在 nputurbo 的 feature scope 内(A 不从快照取)。建议仍把 `nputurbo` 加入 `features:` 列表以带入 `nputurbo` 组件指标。
+- 慢卡结果改 HTTP GET:不再 exec straggler 二进制、不再有 `result_path` 文件中转;`straggler_url` 空则不启动。无认证(纯 GET)。
 - 不处理 `score≤1`(straggler 只记慢卡)。
 - clean 是 all-or-nothing:单卡恢复会连带 clean 仍慢的卡再重新 inject(可接受;若未来工具支持按卡 clean,可回到按卡 restore 以消除抖动)。

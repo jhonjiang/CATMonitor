@@ -114,16 +114,15 @@ type EnergysaveConfig struct {
 }
 
 // NputurboConfig holds the NPU slow-card upclock actuator (nputurbo)
-// configuration (SPEC: features/nputurbo/nputurbo_SPEC.md). Actuation execs
-// /var/npu_turbo; the feature is off by default and starts in dry_run
-// (judge+log) mode. Current frequency is read from snapshot_npu.json's
-// aicore_freq, so snapshot.enabled is a precondition.
+// configuration (SPEC: features/nputurbo/nputurbo_SPEC.md). The slow-card
+// result is fetched via HTTP GET straggler_url (no local exec, no snapshot
+// read); the feature is off by default and starts in dry_run (judge+log)
+// mode. A is the fixed constant 1800 (not queried).
 type NputurboConfig struct {
 	Enabled           bool          `yaml:"enabled"`             // default false
-	Interval          time.Duration `yaml:"interval"`            // control loop period (file poll cadence)
-	StragglerCmd      string        `yaml:"straggler_cmd"`       // straggler command template; {path} replaced
-	ResultPath        string        `yaml:"result_path"`         // where straggler writes its jsonl result
-	StragglerTimeout  time.Duration `yaml:"straggler_timeout"`   // straggler exec timeout
+	Interval          time.Duration `yaml:"interval"`            // control loop period (HTTP poll cadence)
+	StragglerURL      string        `yaml:"straggler_url"`       // HTTP GET endpoint returning the slow-card result (profiler doc)
+	StragglerTimeout  time.Duration `yaml:"straggler_timeout"`   // HTTP GET timeout
 	NpuTurboCmd       string        `yaml:"npu_turbo_cmd"`       // inject command template; {id}/{freq} replaced
 	NpuTurboCleanCmd  string        `yaml:"npu_turbo_clean_cmd"` // clean command (restores all cards); run as-is
 	NpuTurboTimeout   time.Duration `yaml:"npu_turbo_timeout"`   // npu_turbo exec timeout
@@ -191,12 +190,11 @@ func Default() *Config {
 		Nputurbo: NputurboConfig{
 			Enabled:           false,
 			Interval:          60 * time.Second,
-			StragglerCmd:      "straggler path={path}",
-			ResultPath:        "/var/lib/catmonitor/nputurbo/straggler_result.jsonl",
-			StragglerTimeout:  60 * time.Second,
+			StragglerURL:      "",
+			StragglerTimeout:  10 * time.Second,
 			NpuTurboCmd:       "/home/jw/npu_turbo_one.sh inject -n {id} -f {freq}",
 			NpuTurboCleanCmd:  "/home/jw/npu_turbo_one.sh clean",
-			NpuTurboTimeout:   10 * time.Second,
+			NpuTurboTimeout:   120 * time.Second,
 			MaxFreqMhz:        1900,
 			StepMhz:           50,
 			DryRun:            true,

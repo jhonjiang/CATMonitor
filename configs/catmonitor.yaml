@@ -104,20 +104,19 @@ energysave:
   npu_stale_sec: 6
 
 # NPU slow-card upclock actuator (features/nputurbo). Default off; actuation
-# execs /var/npu_turbo. Current freq is read from snapshot_npu.json's
-# aicore_freq, so snapshot.enabled is a precondition. The daemon polls the
-# straggler detector (exec straggler path=<result_path>) every interval to
-# refresh the slow-card list. dry_run defaults true (judge+log only); set
-# dry_run: false + run as root to actuate. See features/nputurbo/nputurbo_SPEC.md.
+# execs /var/npu_turbo. The slow-card result is fetched via HTTP GET
+# straggler_url every interval (no local straggler binary, no snapshot read).
+# straggler_url empty → nputurbo does not start. A is the fixed 1800 (not
+# queried). dry_run defaults true (judge+log only); set dry_run: false + run as
+# root to actuate. See features/nputurbo/nputurbo_SPEC.md.
 nputurbo:
   enabled: false
   interval: 60s
-  straggler_cmd: "straggler path={path}"
-  result_path: /var/lib/catmonitor/nputurbo/straggler_result.jsonl
-  straggler_timeout: 60s
+  straggler_url: "http://127.0.0.1:8080/straggler/result"   # GET → profiler doc (kpi block ignored)
+  straggler_timeout: 10s                                    # HTTP GET timeout
   npu_turbo_cmd: "/home/jw/npu_turbo_one.sh inject -n {id} -f {freq}"
   npu_turbo_clean_cmd: "/home/jw/npu_turbo_one.sh clean"
-  npu_turbo_timeout: 10s
+  npu_turbo_timeout: 120s
   max_freq_mhz: 1900
   step_mhz: 50
   dry_run: true
