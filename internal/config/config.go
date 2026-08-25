@@ -5,6 +5,7 @@ import (
 	"os"
 	"time"
 
+	"github.com/Computing-Availability-Tools/CATMonitor/features/stress"
 	"github.com/Computing-Availability-Tools/CATMonitor/internal/platform"
 	"gopkg.in/yaml.v3"
 )
@@ -15,6 +16,7 @@ type Config struct {
 	Collectors      map[string]CollectorCfg `yaml:"collectors"`
 	Storage         StorageConfig           `yaml:"storage"`
 	Health          HealthConfig            `yaml:"health"`
+	Stress          stress.Config           `yaml:"stress"`
 	Collection      CollectionConfig        `yaml:"collection"`
 	Features        []string                `yaml:"features"` // enabled features; daemon loads features/<name>/metrics.yaml overrides + derives C_comp from their intervals
 	FaultSub        FaultSubConfig          `yaml:"faultsub"`
@@ -209,13 +211,10 @@ func Load(path string) (*Config, error) {
 	cfg := Default()
 	data, err := os.ReadFile(path)
 	if err != nil {
-		if os.IsNotExist(err) {
-			return cfg, nil
-		}
-		return nil, fmt.Errorf("failed to read config file: %w", err)
+		return nil, fmt.Errorf("failed to read config file %s: %w", path, err)
 	}
 	if err := yaml.Unmarshal(data, cfg); err != nil {
-		return nil, fmt.Errorf("failed to parse config file: %w", err)
+		return nil, fmt.Errorf("failed to parse config file %s: %w", path, err)
 	}
 	return cfg, nil
 }

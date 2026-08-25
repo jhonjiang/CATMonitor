@@ -23,7 +23,7 @@ components:
         static: false
       - name: context_switches
         cn_name: "上下文切换次数"
-        priority: Low
+        priority: Medium
         unit: "次/s"
         static: false
       - name: process_count
@@ -123,11 +123,6 @@ components:
         static: false
       - name: core_num
         cn_name: "CPU核数量"
-        priority: Low
-        unit: "个"
-        static: true
-      - name: die_core_num
-        cn_name: "单个die核数量"
         priority: Low
         unit: "个"
         static: true

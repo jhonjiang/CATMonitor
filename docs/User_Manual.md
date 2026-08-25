@@ -9,15 +9,15 @@
 
 ```bash
 make all                                       # 编译 catmonitor + web + dfee 三二进制
-./bin/catmonitor daemon &                      # 启动守护进程（采集 + Prometheus :9100 + snapshot 生产）
-curl -s http://localhost:9100/metrics | head   # 抓取 Prometheus 指标（catmonitor_* 命名）
+./bin/catmonitor daemon &                      # 启动守护进程（采集 + Prometheus :19320 + snapshot 生产）
+curl -s http://localhost:19320/metrics | head   # 抓取 Prometheus 指标（catmonitor_* 命名）
 ./bin/catmonitor-dfee -exporter=enabled -snapshot-dir /var/lib/catmonitor/snapshot &  # dfee + :9333 exporter（node_*/dsmi_*）
 curl -s http://localhost:9333/metrics | head   # 抓取 node_exporter 风格指标
 ./bin/catmonitor health                        # 一次性健康检查
 ./bin/catmonitor collect -o table | head       # 一次性指标采集
 ```
 
-> Web 仪表盘（可选）：`./bin/catmonitor-web -snapshot-dir /var/lib/catmonitor/snapshot`，浏览器打开 http://localhost:9527。
+> Web 仪表盘（可选）：`./bin/catmonitor-web -snapshot-dir /var/lib/catmonitor/snapshot`，浏览器打开 http://localhost:19322。
 > 容器化部署（可选）：`docker/docker/build.sh && docker compose -f docker/docker-compose.yml up -d`，详见 [§12](#12-容器化部署) 与 [docker/README.md](../docker/README.md)。
 
 ## 目录
@@ -41,34 +41,45 @@ curl -s http://localhost:9333/metrics | head   # 抓取 node_exporter 风格指�
 
 ### 1.1 依赖
 
-- Go 1.21+
+- Go 1.23.4+（以 `go.mod` 为准；系统同时安装多个版本时必须明确选择满足要求的工具链）
 - （可选）NPU 服务器：CANN SDK（`libdcmi.so`），用 `-tags dcmi` 启用 DCMI CGo 采集
+- （可选）NPU 可靠性压测：仓库已包含 Mulan PSL v2 的固定 Ascend NPU Burn 源码；节点管理员另行准备匹配的 CANN、PyTorch/torch_npu 和驱动环境或基础镜像
 - （可选）`nvidia-smi` / `npu-smi` / `hccn_tool` / `ipmitool` / `smartctl`：对应采集器无该命令时优雅降级（返回空，不崩溃）
 
 ### 1.2 编译
 
 ```bash
+# 先确认实际使用的工具链；不能只确认系统中“安装过”新 Go
+GO_BIN=${GO_BIN:-/opt/catmonitor/toolchains/go1.25.1/bin/go}
+test -x "$GO_BIN"
+"$GO_BIN" version
+mkdir -p bin
+
 # 一键构建 daemon + web + dfee 三个二进制
-make all
+make all GO="$GO_BIN"
 
 # 分别构建
-make build          # daemon: bin/catmonitor（CANN DCMI 头存在时自动加 -tags dcmi）
-make web            # catmonitor-web: bin/catmonitor-web
-make dfee           # catmonitor-dfee: bin/catmonitor-dfee
+make build GO="$GO_BIN"  # daemon: bin/catmonitor（CANN DCMI 头存在时自动加 -tags dcmi）
+make web GO="$GO_BIN"    # catmonitor-web: bin/catmonitor-web
+make dfee GO="$GO_BIN"   # catmonitor-dfee: bin/catmonitor-dfee
 
 # 或直接 go build
-go build -o bin/catmonitor ./cmd/catmonitor
-go build -o bin/catmonitor-web ./features/web
-go build -o bin/catmonitor-dfee ./features/dfee
+GOTOOLCHAIN=local "$GO_BIN" build -o bin/catmonitor ./cmd/catmonitor
+GOTOOLCHAIN=local "$GO_BIN" build -o bin/catmonitor-web ./features/web
+GOTOOLCHAIN=local "$GO_BIN" build -o bin/catmonitor-dfee ./features/dfee
 
 # NPU 服务器强制启用 DCMI CGo 采集（make build 已自动探测，手动时需加 tag）
-go build -tags dcmi -o bin/catmonitor ./cmd/catmonitor
+GOTOOLCHAIN=local "$GO_BIN" build -tags dcmi -o bin/catmonitor ./cmd/catmonitor
 
 # Windows 交叉编译
-GOOS=windows go build -o bin/catmonitor.exe ./cmd/catmonitor
-GOOS=windows go build -o bin/catmonitor-web.exe ./features/web
-GOOS=windows go build -o bin/catmonitor-dfee.exe ./features/dfee
+GOOS=windows GOTOOLCHAIN=local "$GO_BIN" build -o bin/catmonitor.exe ./cmd/catmonitor
+GOOS=windows GOTOOLCHAIN=local "$GO_BIN" build -o bin/catmonitor-web.exe ./features/web
+GOOS=windows GOTOOLCHAIN=local "$GO_BIN" build -o bin/catmonitor-dfee.exe ./features/dfee
 ```
+
+`GOTOOLCHAIN=local` 不会下载或升级 Go，它只要求使用当前被调用的 `go` 二进制。
+因此系统默认 `go` 为 1.21.9 时，`GOTOOLCHAIN=local go build` 仍会失败；必须显式
+调用满足 `go.mod` 要求的 `GO_BIN`，或先把对应 `bin` 目录放到 `PATH` 最前面。
 
 > 默认构建排除 CGo（`dcmi_cgo.go` 在 `//go:build cgo && linux && dcmi` 后），无 CANN SDK 也能编译；NPU 的 DCMI 指标在无 `-tags dcmi` 时优雅降级。`make build` 自动探测 `/usr/local/Ascend/driver/include/dcmi_interface_api.h`，存在则加 `-tags dcmi`（可用 `DCMITAG=` 强制关闭、`DCMITAG=-tags dcmi` 强制开启）。
 > 三个二进制产物均在 `bin/`（Makefile：`make all` = build + web + dfee）。
@@ -111,10 +122,22 @@ health:
   enabled: true             # v0.3.3 起 daemon 不再周期评估（保留字段）
   weight_scheme: auto      # 仅 `catmonitor health` CLI 使用：auto | cpu_only | accelerated_8card | accelerated_4card
 
+stress:
+  enabled: false
+  web_enabled: false
+  script_path: /opt/catmonitor/stress/benchmark_check.sh
+  report_path: /var/lib/catmonitor/stress/stress-latest.json
+  default_benchmarks: [stream]
+  benchmarks:
+    stream: { enabled: false, timeout: 1m }
+    hpl: { enabled: false, timeout: 2h }
+    hpcg: { enabled: false, result_dir: "", timeout: 3m }
+    npu_burn: { enabled: false, timeout: 30m }
+
 collection:
   min_priority: medium     # low (全采) | medium (跳过 Low) | high (仅 High)——按优先级阈值预过滤采集
 
-features: [web, dfee]      # feature-scope 白名单（各 feature metrics.yaml 并集；空 = 默认全集）；派生 per-comp cadence
+features: [web, dfee, health] # feature-scope 白名单（各 feature metrics.yaml 并集；空 = 默认全集）；派生 per-comp cadence
 
 snapshot:                 # daemon 统一生产 snapshot 供 web/dfee 只读消费（默认 on）
   enabled: true           # off 时 daemon 不写 snapshot；on 时 web/dfee 须以只读消费者运行
@@ -122,7 +145,7 @@ snapshot:                 # daemon 统一生产 snapshot 供 web/dfee 只读消�
 
 faultsub:                 # 故障订阅推送（默认 off）；详见 features/faultsub/faultsub_SPEC.md
   enabled: false
-  rest_addr: ":9101"      # 订阅 REST API 监听地址
+  rest_addr: ":19321"      # 订阅 REST API 监听地址
   webhook_timeout: 5s     # webhook 推送超时
   webhook_retry: 1        # 失败重试次数
   event_buffer: 1024     # 近期事件环形缓冲（GET /faultsub/events 回补）
@@ -151,10 +174,11 @@ straggler_output:         # 落后节点 KPI 文件输出（默认 off）；详�
 | `collectors.*.enabled` / `.interval` | daemon | 各采集器开关与采集周期 |
 | `storage.*` | daemon | JSONL 数据目录、保留时长、轮转策略 |
 | `health.weight_scheme` | `health` CLI | 健康度权重方案；`enabled` v0.3.3 起 daemon 不再周期评估 |
+| `stress.*` | `stress` CLI / Web | 可靠性压测授权、共享报告、项目和最大运行窗口；节点执行参数由部署脚本维护 |
 | `collection.min_priority` | daemon / collect | 按优先级阈值预过滤采集粒度 |
 | `features` | daemon | feature-scope 白名单：各 feature `metrics.yaml` 并集；派生 per-component cadence `C_comp = min(feature interval)` |
 | `snapshot.enabled` / `.dir` | daemon | snapshot 生产开关与目录（on 时 web/dfee 只读消费） |
-| `faultsub.*` | daemon | 故障订阅推送 opt-in：`enabled`/`rest_addr`(:9101)/`webhook_*`/`event_buffer`/`defaults`/`rules`（含 `card_drop` 掉卡检测开关）；off 时 daemon 行为不变 |
+| `faultsub.*` | daemon | 故障订阅推送 opt-in：`enabled`/`rest_addr`(:19321)/`webhook_*`/`event_buffer`/`defaults`/`rules`（含 `card_drop` 掉卡检测开关）；off 时 daemon 行为不变 |
 | `straggler_output.*` | daemon | 落后节点 KPI 输出 opt-in：`enabled`/`data_dir`/`retention`/`flush_interval`；off 时无 KPI 文件 |
 
 ### 配置路径
@@ -164,7 +188,7 @@ straggler_output:         # 落后节点 KPI 文件输出（默认 off）；详�
 | Linux | `/etc/catmonitor/catmonitor.yaml` | `/var/lib/catmonitor/data` |
 | Windows | `C:\ProgramData\catmonitor\catmonitor.yaml` | `C:\ProgramData\catmonitor\data` |
 
-可用 `-config` 覆盖配置路径（注：短 flag `-c` 已注册但未生效，请用长形式 `-config`）。指标采集目录 `metrics.yaml` 加载顺序：环境变量 `CATMONITOR_METRICS` → 配置目录下 `metrics.yaml` → 开发回退 `configs/metrics.yaml`。
+普通 CLI 可用 `-config` 覆盖配置路径（现有短 flag `-c` 尚未接入普通命令）；stress CLI 同时支持 `-c/--config`。Web 默认读取同一平台路径，非标准部署可使用 `CATMONITOR_CONFIG` 或 `-config` 覆盖。指标采集目录 `metrics.yaml` 加载顺序：环境变量 `CATMONITOR_METRICS` → 配置目录下 `metrics.yaml` → 开发回退 `configs/metrics.yaml`。
 
 ---
 
@@ -177,6 +201,7 @@ Commands:
   daemon       启动守护进程（持续采集 + Prometheus 导出）— 默认；健康度评估由 health 子命令按需执行
   collect      单次采集所有指标快照
   health       执行一次健康检查
+  stress       显式运行 Linux 可靠性压测
   list         列出所有已注册采集器
   version      显示版本信息
 
@@ -195,6 +220,7 @@ Flags:
 | 常驻采集 + Prometheus | `catmonitor daemon` |
 | 一次性巡检（指标） | `catmonitor collect -o table` |
 | 一次性健康体检 | `catmonitor health` |
+| Linux 可靠性压测 | `catmonitor stress -o table` |
 | 查看采集器清单 | `catmonitor list` |
 | 查看版本 | `catmonitor version` |
 | Web 仪表盘 | `catmonitor-web`（独立二进制，见 §4） |
@@ -203,7 +229,7 @@ Flags:
 
 ```bash
 $ catmonitor version
-CATMonitor v0.3.3 (Go 1.23+)
+CATMonitor v0.3.5 (Go 1.23+)
 ```
 
 ### 3.2 list — 采集器注册表
@@ -253,16 +279,28 @@ catmonitor health -o json    # JSON
 输出示例：
 
 ```
-Overall Score:  [████████████████████████████░░]  95 / 100   [ Excellent ]
-Server Type:    accelerated
-  CPU        10 / 10   OK
-  MEMORY     18 / 20   OK      swap>50% (-2)
-  DISK        7 / 10   Warning smart_failed (-3)
-  NPU        60 / 60   OK
-  TOTAL      95 / 100  Excellent
+Overall Score:  [██████████████████████████████]  90 / 100   [ Excellent ]
+Server Type:    cpu_only
+  CPU        25 / 25   OK
+  MEMORY     25 / 25   OK
+  DISK       30 / 30   OK
+  NETWORK    10 / 10   OK
+  TOTAL      90 / 100  Excellent
 ```
 
-### 3.5 daemon — 守护进程
+### 3.5 stress — 可靠性压测
+
+```bash
+catmonitor stress --help
+catmonitor stress -o table                  # 运行 YAML 的 default_benchmarks
+catmonitor stress --bench stream -o table   # 覆盖本次运行项目
+catmonitor stress --bench npu_burn -o table # Ascend NPU Burn（需节点安装和脚本适配）
+catmonitor stress -o json                   # 回显完整 JSON 报告
+```
+
+stress 只在用户显式请求时运行。主配置只定义功能开关、共享报告、项目和最大运行窗口；benchmark 绝对路径、环境变量和 MPI/NUMA 参数由节点部署的 `benchmark_check.sh` 维护。Ascend NPU Burn 固定源码随仓库提供，管理员只需准备匹配的原生依赖或 CANN/torch_npu 基础镜像并构建运行环境；脚本校验其 `npu_burn_results.csv` 全部 PASS、无 SDC 错误且全局设备汇总无 FAIL。CLI 与 Web 共享报告和 Linux 文件锁，不能同时启动两组作业。日常启用与使用见 [STRESS_USER_GUIDE.md](../features/stress/STRESS_USER_GUIDE.md)，完整构建、适配、升级及验收见 [STRESS_TEST_GUIDE.md](../features/stress/STRESS_TEST_GUIDE.md)。
+
+### 3.6 daemon — 守护进程
 
 ```bash
 catmonitor daemon                       # 默认配置前台运行
@@ -274,7 +312,7 @@ daemon 启动后：
 - Scheduler 按各采集器 `interval` 周期采集 → 写 JSONL（`{data_dir}/{component}_{date}.jsonl`）
 - 采集粒度由 `collection.min_priority` 控制：`low` 全采（默认），`medium` 跳过 Low 指标组，`high` 仅采 High；采集器经 `AnyWanted` DI 在执行前跳过无需采集的指标组
 - `exporter.CachingStorage` 包装存储层，一次采集同时落盘 + 缓存到内存
-- HTTP `/metrics` 端点监听 `:9100`（见 §5）
+- HTTP `/metrics` 端点监听 `:19320`（见 §5）
 - v0.3.3 起 daemon 不再周期评估健康度；健康度评估改由 `catmonitor health` 子命令按需执行
 
 捕获 `SIGINT`/`SIGTERM` 优雅退出。
@@ -283,7 +321,7 @@ daemon 启动后：
 
 ## 4. Web 仪表盘（catmonitor-web）
 
-独立二进制，**只读消费** daemon 产出的 snapshot（global `snapshot.json` + per-comp `snapshot_<comp>.json`），可视化单机健康度与各部件指标。不再自行采集——需先启动 daemon 并开启 `snapshot.enabled`。
+独立二进制，**只读消费** daemon 产出的 snapshot（global `snapshot.json` + per-comp `snapshot_<comp>.json`），可视化单机健康度与各部件指标，不再自行采集。独立 stress feature 可按主配置额外挂载受保护的作业接口，但不会写 snapshot。
 
 ### 4.1 启动
 
@@ -295,16 +333,18 @@ daemon 启动后：
 catmonitor daemon
 
 # 再启动 web 只读消费者（-snapshot-dir 须与 daemon snapshot.dir 一致）
-catmonitor-web -addr :9527 -snapshot-dir /var/lib/catmonitor/snapshot
-# 浏览器打开 http://localhost:9527（实际端口见启动日志 "web server starting"）
+catmonitor-web -addr :19322 -snapshot-dir /var/lib/catmonitor/snapshot
+# 非标准主配置路径追加：-config /path/to/catmonitor.yaml
+# 浏览器打开 http://<server-address>:19322（实际端口见启动日志 "web server starting"）
 ```
 
-> 端口 `:9527` 被占用时自动 +1 回退（`:9528`…）。能效监控改为独立二进制 `catmonitor-dfee`（见 §6），不再作为 web 子路由。
+> 端口 `:19322` 被占用时自动 +1 回退。能效监控改为独立二进制 `catmonitor-dfee`（见 §6），不再作为 web 子路由。
 
 ### 4.2 页面
 
 - **概览页**（`/`）：整体健康度（总分 + 进度条 + 等级）+ 设备规格面板（点击展开完整规格）+ 各部件状态 + 部件概览卡片（含趋势 sparkline）
 - **部件详情页**（`#/<component>`，如 `#/cpu`）：部件得分/扣分项 + 趋势面板（该部件全部历史序列 sparkline，数据来自 daemon 产出的 per-comp history）+ 全部指标表
+- **可靠性压测**（`/stress/`）：独立页面；默认只读展示配置和共享报告，只有 Linux、回环监听及 `stress.enabled/web_enabled` 均满足时才能提交作业
 
 ### 4.3 REST API（只读）
 
@@ -315,6 +355,8 @@ catmonitor-web -addr :9527 -snapshot-dir /var/lib/catmonitor/snapshot
 | GET | `/api/config` | 当前配置（cadence + history_points，只读） |
 
 > 重构删除 `POST /api/config`（间隔热改）与 `POST /api/refresh`（立即采集）——刷新间隔由 daemon cadence 决定。详细设计与扩展机制见 [features/web/Web_SPEC.md](../features/web/Web_SPEC.md)。
+>
+> `/api/stress/*` 由独立 stress feature 提供，不属于 snapshot API；契约见 [STRESS_SPEC.md](../features/stress/STRESS_SPEC.md)。
 
 ---
 
@@ -324,10 +366,10 @@ daemon 内置 Prometheus 兼容导出，无需额外进程。
 
 ### 5.1 接入
 
-启动 `catmonitor daemon` 后，`/metrics` 端点监听 `:9100`：
+启动 `catmonitor daemon` 后，`/metrics` 端点监听 `:19320`：
 
 ```bash
-$ curl http://localhost:9100/metrics
+$ curl http://localhost:19320/metrics
 # HELP catmonitor_cpu_usage cpu/usage
 # TYPE catmonitor_cpu_usage gauge
 catmonitor_cpu_usage{core="total"} 0
@@ -359,7 +401,7 @@ catmonitor_network_rx_bytes_total{interface="eth0"} 123456
 scrape_configs:
   - job_name: catmonitor
     static_configs:
-      - targets: ['localhost:9100']
+      - targets: ['localhost:19320']
     metrics_path: /metrics
     scrape_interval: 15s
 ```
@@ -368,10 +410,10 @@ scrape_configs:
 
 ### 5.5 dfee 独立 Prometheus exporter（:9333）
 
-除 daemon 的 `:9100/metrics`（`catmonitor_*` 命名）外，dfee 二进制另内置独立 exporter，输出对齐 node_exporter/dsmi 风格的命名，与 daemon 导出互不冲突。由 `-exporter=enabled` 开启：
+除 daemon 的 `:19320/metrics`（`catmonitor_*` 命名）外，dfee 二进制另内置独立 exporter，输出对齐 node_exporter/dsmi 风格的命名，与 daemon 导出互不冲突。由 `-exporter=enabled` 开启：
 
 ```bash
-$ catmonitor-dfee -addr :9528 -exporter=enabled -exporter-port=9333 -snapshot-dir /var/lib/catmonitor/snapshot
+$ catmonitor-dfee -addr :19323 -exporter=enabled -exporter-port=9333 -snapshot-dir /var/lib/catmonitor/snapshot
 $ curl http://localhost:9333/metrics
 node_cpu_seconds_total{mode="user"} 948021
 node_memory_MemTotal_bytes 2163847168
@@ -405,20 +447,20 @@ static_software_info{os_version="Ubuntu 26.04 LTS",python_version="3.14.4",...} 
 catmonitor daemon
 
 # 启动 dfee 独立二进制（-snapshot-dir 须与 daemon snapshot.dir 一致）
-catmonitor-dfee -addr :9528 -snapshot-dir /var/lib/catmonitor/snapshot
-# 浏览器打开 http://localhost:9528/dfee/（实际端口见启动日志 "dfee server starting"）
+catmonitor-dfee -addr :19323 -snapshot-dir /var/lib/catmonitor/snapshot
+# 浏览器打开 http://localhost:19323/dfee/（实际端口见启动日志 "dfee server starting"）
 
 # 启动 dfee 并开启 Prometheus exporter（:9333/metrics，详见 §5.5）
-catmonitor-dfee -addr :9528 -exporter=enabled -exporter-port=9333 -snapshot-dir /var/lib/catmonitor/snapshot
+catmonitor-dfee -addr :19323 -exporter=enabled -exporter-port=9333 -snapshot-dir /var/lib/catmonitor/snapshot
 ```
 
-> 端口 `:9528` 被占用时自动 +1 回退。dfee 不再注册到 web 路由，独立进程运行。
+> 端口 `:19323` 被占用时自动 +1 回退。dfee 不再注册到 web 路由，独立进程运行。
 
 **启动参数**：
 
 | 参数 | 默认 | 说明 |
 |------|------|------|
-| `-addr` | `:9528` | SPA 监听地址 |
+| `-addr` | `:19323` | SPA 监听地址 |
 | `-snapshot-dir` | `/var/lib/catmonitor/snapshot` | daemon snapshot 目录（须一致） |
 | `-exporter` | `disabled` | Prometheus exporter 开关：`enabled`/`disabled` |
 | `-exporter-port` | `9333` | exporter 监听端口（输出 `node_*`/`dsmi_*`/`ipmi_*`/`static_*`，见 §5.5） |
@@ -514,12 +556,12 @@ catmonitor-dfee -addr :9528 -exporter=enabled -exporter-port=9333 -snapshot-dir 
 |------|-------------|
 | `catmonitor daemon -v` 直接退出 | `-v/--verbose` 未实现；移除该参数，日志级别见源码 `setupLogger` |
 | `catmonitor daemon --data-dir X` 退出 | `--data-dir` 未实现；数据目录改配置 `storage.data_dir` |
-| `:9100` 被占用 | exporter 端口固定 `:9100`，释放占用进程或修改 `features/exporter` 中 `ServeMetrics(":9100", ...)` |
-| `:9527` 被占用 | web 自动 +1 回退到 `:9528` 等，看启动日志 `web server starting addr=...` |
+| `:19320` 被占用 | exporter 端口固定 `:19320`，释放占用进程或修改 `features/exporter` 中 `ServeMetrics(":19320", ...)` |
+| `:19322` 被占用 | web 自动 +1 回退到 `:19323` 等，看启动日志 `web server starting addr=...` |
 | `catmonitor-web` 报 `metrics catalog init failed` | web 须从仓库根目录运行（`metrics.Init` 加载相对路径 `configs/metrics.yaml`） |
-| collect / :9100 指标数量变少 | 检查 `collection.min_priority`：`medium` 跳过 Low、`high` 仅 High |
+| collect / :19320 指标数量变少 | 检查 `collection.min_priority`：`medium` 跳过 Low、`high` 仅 High |
 | GPU/NPU/Chassis 无数据 | 对应命令（`nvidia-smi`/`npu-smi`/`ipmitool`）缺失即优雅降级返回空，非错误；`npu` 仍输出 `npu_num=0` |
-| `health` 评分与 web 不一致 | CLI 因 `npu_num` 指标判 `accelerated`、web 据真实硬件判 `cpu_only`，口径不同（已知项） |
+| health 评分与 web 不一致 | v0.3.5 已修复：CLI 与 snapshot 同 scope 下判定一致（无 NPU 硬件均判 `cpu_only`）；若仍不一致，检查 CLI 与 daemon 是否用同一 `features` 配置 |
 | DCMI/NPU CGo 编译失败 | `dcmi_cgo.go` 在 `-tags dcmi` 后，需真机 CANN SDK；默认构建排除即可 |
 | 健康度无 `health_*.jsonl` 文件 | v0.3.3 起 daemon 不再落盘健康度；用 `catmonitor health -o json >> health.jsonl` 自行持久化 |
 | dfee exporter `:9333` 无 dsmi/ipmi 数据 | 无 NPU/IPMI 硬件时优雅降级为空，符合预期；`static_*` 仍采集（命令可用字段有值，否则空） |
@@ -556,10 +598,10 @@ docker compose -f docker/docker-compose.yml up -d
 
 | 容器端口 | 服务 | 端点 |
 |---------|------|------|
-| 9100 | daemon Prometheus exporter | `/metrics`、`/-/healthy`、`/-/ready` |
-| 9101 | faultsub REST API（配置开启） | `/faultsub/*` |
-| 9527 | web 仪表盘 | `/`、`/api/snapshot`、`/api/collectors` |
-| 9528 | dfee SPA | `/`、`/api/dfee` |
+| 19320 | daemon Prometheus exporter | `/metrics`、`/-/healthy`、`/-/ready` |
+| 19321 | faultsub REST API（配置开启） | `/faultsub/*` |
+| 19322 | web 仪表盘 | `/`、`/api/snapshot`、`/api/collectors`、`/stress/` |
+| 19323 | dfee SPA | `/`、`/api/dfee` |
 | 9333 | dfee Prometheus exporter | `/metrics`（`node_*`/`dsmi_*`/`ipmi_*`/`static_*`） |
 
 ### 12.4 NPU 环境注意事项

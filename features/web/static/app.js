@@ -6,7 +6,7 @@ const MANIFEST = {
   memory: { title: '内存', headline: 'memory_usage', headlineLabel: '内存使用率 (%)',
             key: [ 'usage', 'swap_usage', 'saturation', 'fragmentation',
                    'module_num', 'ecc_ce_errors', 'oom_count', 'page_faults' ] },
-  disk: { title: '磁盘', headline: 'disk_space_usage', headlineLabel: '磁盘使用率 (%)',
+  disk: { title: '磁盘', headline: 'disk_space_usage', headlineLabel: '分区空间使用率最高 (%)',
           key: [ 'space_usage', 'throughput', 'iops', 'io_wait',
                  'io_errors', 'smart_status' ] },
   gpu: { title: 'GPU', headline: 'gpu_utilization', headlineLabel: 'GPU 使用率 (%)',
@@ -22,7 +22,7 @@ const MANIFEST = {
 const METRIC_NAMES = {
   usage: '使用率', load_average: '负载', context_switches: '上下文切换',
   process_count: '进程数', model_info: '型号', temperature: '温度', frequency: '频率',
-  space_usage: '空间使用率', space_detail: '空间明细', throughput: '吞吐量',
+  space_usage: '分区空间使用率', space_detail: '分区空间明细', throughput: '吞吐量',
   io_wait: 'IO Wait', io_errors: 'IO 错误', iops: 'IOPS',
   smart_status: 'SMART 状态', smart_temperature: 'SMART 温度',
   memory_usage: '显存使用率', memory_detail: '明细',
@@ -39,7 +39,7 @@ const METRIC_NAMES = {
   softirq_time: '软中断时间', steal_time: '抢占时间',
   user_util: '用户使用率', system_util: '系统使用率', idle_util: '空闲率', iowait_util: 'IO 等待率',
   avg_freq: '平均频率', min_freq: '最小频率', max_freq: '最大频率',
-  numa_node_num: 'NUMA 节点数', core_num: '物理核数', die_core_num: 'Die 核数',
+  numa_node_num: 'NUMA 节点数', core_num: '物理核数',
   numa_core_num: 'NUMA 核数', cpu_num: 'CPU 数',
   online_core_num: '在线核数', offline_core_num: '离线核数', isolated_core_num: '隔离核数',
   l1d_cache_size: 'L1d 缓存', l1i_cache_size: 'L1i 缓存', l2_cache_size: 'L2 缓存', l3_cache_size: 'L3 缓存',
@@ -68,11 +68,12 @@ const LABEL_NAMES = {
   model_name: '型号', cache_size: '缓存', core: '核心', node: '节点', die: 'Die',
   pretty_name: 'OS', version_id: '版本号', kernel: '内核',
   npu_id: 'NPU ID', chip_id: '芯片 ID',
+  pci_addr: 'PCI 地址', pci_device: '设备型号',
 };
 
 const SERVER_TYPE_TEXT = {
-  cpu_only: '仅 CPU',
-  accelerated: '加速型（含 GPU/NPU）',
+  cpu_only: '通用服务器',
+  accelerated: 'AI 服务器（含 NPU/GPU）',
 };
 
 const RULE_TEXT = {
@@ -137,21 +138,246 @@ const SPEC_DEFS = {
   module_info:  { type: '内存条', primary: 'locator' },
 };
 
+const CPU_SPEC_ORDER = {
+  model_info: 0, cpu_num: 1, core_num: 2,
+  min_freq: 3, max_freq: 4,
+  l1d_cache_size: 5, l1i_cache_size: 6, l2_cache_size: 7, l3_cache_size: 8,
+  numa_node_num: 9, numa_core_num: 10,
+};
+
 const SERIES_LABELS = {
-  cpu_usage: 'CPU 使用率 (%)', cpu_load_average: '负载 (1m)',
+  cpu_usage: 'CPU 使用率 (%)', cpu_load_average: '系统负载 1m',
   memory_usage: '内存使用率 (%)', memory_swap_usage: 'Swap 使用率 (%)',
-  disk_space_usage: '磁盘使用率 (%)',
+  disk_space_usage: '分区空间使用率最高 (%)',
   gpu_utilization: 'GPU 使用率 (%)', gpu_memory_usage: 'GPU 显存使用率 (%)', gpu_temperature: 'GPU 温度 (°C)',
   npu_utilization: 'NPU 使用率 (%)', npu_memory_usage: 'NPU 显存使用率 (%)', npu_temperature: 'NPU 温度 (°C)',
   // v0.2.0 trends.
-  cpu_temperature: 'CPU 温度 (°C)', cpu_power: 'CPU 功耗 (W)',
+  cpu_temperature: 'CPU 最高温度 (°C)', cpu_power: 'CPU 最高功耗 (W)',
   cpu_avg_freq: 'CPU 平均频率 (MHz)', cpu_context_switches: '上下文切换 (次/s)',
-  cpu_ce_errors: 'CPU CE 错误 (次)',
-  memory_saturation: '内存压力 (%)', memory_fragmentation: '内存碎片化 (%)',
+  cpu_ce_errors: 'CPU CE 错误最大值 (次)',
+  memory_saturation: '内存压力 (%)', memory_fragmentation: '内存碎片化最大 (%)',
   memory_swap_in: 'Swap 入页 (次/s)', memory_power: '内存功耗 (W)',
-  disk_io_wait: 'IO Wait (%)', disk_iops: '磁盘 IOPS (次/s)', disk_throughput: '磁盘吞吐 (MB/s)',
-  network_throughput: '网络吞吐 (bytes/s)', network_packet_count: '网络包速率 (个/s)',
-  network_error_count: '网络错误 (次)',
+  disk_io_wait: 'IO Wait (%)', disk_iops: '磁盘 IOPS 最大 (次/s)', disk_throughput: '磁盘吞吐最大 (MB/s)',
+  network_throughput: '网络吞吐最大 (bytes/s)', network_packet_count: '网络包速率最大 (个/s)',
+  network_error_count: '网络错误最大 (次)',
+};
+
+const METRIC_DESCRIPTIONS = {
+  // CPU
+  'cpu:usage': 'CPU 使用率',
+  load_average: '系统平均负载，过去 N 分钟运行队列平均进程数',
+  'cpu:temperature': 'CPU 温度',
+  frequency: '每核当前频率',
+  context_switches: '上下文切换次数，每秒切换次数',
+  process_count: '运行进程数',
+  model_info: 'CPU 型号信息',
+  user_time: '用户态运行时间，用户程序占用的 CPU 时间',
+  nice_time: '低优先级用户进程时间',
+  system_time: '内核态运行时间，内核程序占用的 CPU 时间',
+  idle_time: '空闲时间，CPU 未执行任何任务的时间',
+  iowait_time: '等待 IO 时间，CPU 等待磁盘 IO 完成的时间',
+  irq_time: '硬中断处理时间',
+  softirq_time: '软中断处理时间',
+  steal_time: '虚拟化被窃取时间，被 Hypervisor 占用的时间',
+  user_util: '用户态平均利用率',
+  system_util: '内核态平均利用率',
+  idle_util: '空闲占比',
+  iowait_util: 'IO 等待占比',
+  numa_node_num: 'NUMA 节点数量',
+  online_core_num: '在线核心数',
+  offline_core_num: '离线核心数',
+  isolated_core_num: '隔离核心数，被 isolcpus 隔离的核数',
+  mem_temperature: 'CPU 内存区域温度',
+  core_num: '物理核总数',
+  numa_core_num: '每个 NUMA 节点的核数',
+  cpu_num: 'CPU 个数（路数），物理 CPU 封装数',
+  avg_freq: '所有在线核心当前频率的算术平均',
+  min_freq: 'CPU 最小频率（硬件最低频率）',
+  max_freq: 'CPU 最大频率（硬件最高频率）',
+  cpu_ce_errors: 'CPU 可纠正 ECC 错误数',
+  cpu_uce_errors: 'CPU 不可纠正 ECC 错误数',
+  power: 'CPU 功率',
+  l1d_cache_size: 'L1d 缓存大小（数据缓存）',
+  l1i_cache_size: 'L1i 缓存大小（指令缓存）',
+  l2_cache_size: 'L2 缓存大小',
+  l3_cache_size: 'L3 缓存大小',
+  numa_order_num: 'NUMA 节点 buddy order 数量，可用内存块规格数',
+  numa_info: 'NUMA 节点最大可用连续 order，值越大碎片越少',
+  // Memory
+  'memory:usage': '内存使用率',
+  swap_usage: 'Swap 使用率',
+  swap_detail: 'Swap 原始值（总量/已用/空闲）',
+  swap_in: '换入页数，每秒从 Swap 换入内存的页数',
+  swap_out: '换出页数，每秒从内存换出到 Swap 的页数',
+  saturation: '内存饱和度，因内存压力导致任务阻塞的时间占比',
+  fragmentation: '内存碎片化程度，order 0 空闲页占比',
+  ecc_ce_errors: '内存可纠正 ECC 错误数',
+  ecc_uce_errors: '内存不可纠正 ECC 错误数',
+  oom_count: 'OOM 触发次数，内核 OOM Killer 杀进程的次数',
+  page_faults: '缺页错误次数，每秒缺页次数',
+  isolated_pages: '隔离页总数，正在迁移或 offline 被临时隔离的页',
+  isolated_anon_pages: '隔离匿名页数',
+  isolated_file_pages: '隔离文件页数',
+  free_pages: '空闲页数',
+  module_num: '内存条数量',
+  module_size: '内存条容量',
+  module_info: '内存条静态信息（型号/速率/厂商/类型）',
+  usage_detail: '内存明细（总量/已用/空闲/Buffers/Cached 等）',
+  // Disk
+  space_usage: '分区空间使用率',
+  space_detail: '分区空间明细（总量/已用/可用）',
+  iops: '每秒读写 IOPS（输入输出操作数）',
+  'disk:throughput': '读写吞吐量',
+  read_latency: '读耗时，每秒读 IO 花费的时间',
+  write_latency: '写耗时，每秒写 IO 花费的时间',
+  io_wait: 'IO 等待占比，CPU 等待磁盘 IO 的时间占比',
+  smart_status: 'SMART 健康状态（PASSED/FAILED）',
+  smart_temperature: '硬盘温度',
+  io_errors: 'IO 错误计数',
+  read_sectors_total: '读扇区总数',
+  written_sectors_total: '写扇区总数',
+  read_time_total: '读耗时总计（累计）',
+  write_time_total: '写耗时总计（累计）',
+  // GPU
+  utilization: 'GPU 使用率',
+  memory_usage: 'GPU 显存使用率',
+  'gpu:temperature': 'GPU 温度',
+  power_draw: 'GPU 功耗',
+  fan_speed: '风扇转速',
+  ecc_errors: 'GPU ECC 错误数',
+  clock_frequency: 'GPU 时钟频率',
+  memory_detail: 'GPU 显存明细（已用/总量）',
+  // NPU
+  health_status: 'NPU 健康状态码（OK/Warning/Alarm/Critical）',
+  npu_num: 'NPU 设备数量',
+  chip_type: 'NPU 芯片类型（如 Ascend910A）',
+  driver_version: 'NPU 驱动版本',
+  driver_health: 'NPU 驱动健康状态',
+  error_code: 'NPU 错误码，设备级完整错误码列表',
+  process_info: 'NPU 进程 PID 列表',
+  process_total: 'NPU 进程总数',
+  comm_topo: 'NPU 通信拓扑（如 8*HCCS-Link）',
+  voltage: 'NPU 主电压',
+  aicore_voltage: 'AICore 电压，AI 运算核心电压',
+  hybrid_voltage: 'Hybrid 电压',
+  cpu_voltage: 'CPU 电压，NPU 内部 CPU（泰山）电压',
+  ddr_voltage: 'DDR 电压',
+  acg_count: 'ACG 调频累计计数',
+  hbm_temp: 'HBM 温度（高带宽内存）',
+  cluster_temp: 'Cluster 温度',
+  peri_temp: '外设区温度',
+  aicore0_temp: 'AICORE0 温度',
+  aicore1_temp: 'AICORE1 温度',
+  ntc1_temp: '热敏电阻 1 温度',
+  ntc2_temp: '热敏电阻 2 温度',
+  ntc3_temp: '热敏电阻 3 温度',
+  ntc4_temp: '热敏电阻 4 温度',
+  soc_max_temp: 'SOC 最高温度',
+  fp_max_temp: '光模块最高温度',
+  ndie_temp: 'NDie 温度',
+  hbm_max_temp: 'HBM 最高温度',
+  aicpu_freq: 'AICPU 频率，AI 处理器频率',
+  aicore_rated_freq: 'AICore 额定频率（最大频率）',
+  aicore_freq: 'AICore 当前频率，AI 核心运算单元的运行频率',
+  ctrlcpu_freq: 'CTRLCPU 频率，NPU 控制单元的运行频率',
+  vector_core_freq: 'Vector Core 频率，向量运算核心频率',
+  hbm_freq: 'HBM 频率，高带宽内存频率',
+  ddr_freq: 'DDR 频率',
+  npu_util: 'NPU 整体利用率',
+  aicpu_util: 'AICPU 利用率',
+  ctrlcpu_util: 'CTRLCPU 利用率，控制单元利用率',
+  vector_core_util: 'Vector Core 利用率，向量运算核心利用率',
+  hbm_bandwidth_util: 'HBM 带宽利用率',
+  ddr_util: 'DDR 利用率',
+  ddr_bandwidth_util: 'DDR 带宽利用率',
+  vdec_util: '视频解码单元 VDEC 利用率',
+  vpc_util: '视频处理单元 VPC 利用率',
+  venc_util: '视频编码单元 VENC 利用率',
+  jpege_util: 'JPEG 编码单元利用率',
+  jpegd_util: 'JPEG 解码单元利用率',
+  hbm_total_memory: 'HBM 总容量（高带宽内存总量）',
+  hbm_used_memory: 'HBM 已用容量',
+  hbm_single_ecc: 'HBM 单比特 ECC 错误（可纠正）',
+  hbm_double_ecc: 'HBM 双比特 ECC 错误（不可纠正）',
+  hbm_single_ecc_isolated: 'HBM 单比特错误隔离页数',
+  hbm_double_ecc_isolated: 'HBM 双比特错误隔离页数',
+  ddr_single_ecc: 'DDR 单比特 ECC 错误（可纠正）',
+  ddr_double_ecc: 'DDR 双比特 ECC 错误（不可纠正）',
+  ddr_single_ecc_isolated: 'DDR 单比特错误隔离页数',
+  ddr_double_ecc_isolated: 'DDR 双比特错误隔离页数',
+  llc_write_hit_rate: 'LLC 写命中率（末级缓存）',
+  llc_read_hit_rate: 'LLC 读命中率（末级缓存）',
+  llc_throughput: 'LLC 吞吐量（末级缓存）',
+  net_tx_bandwidth: 'NPU 网口发送带宽',
+  net_rx_bandwidth: 'NPU 网口接收带宽',
+  roce_link_status: 'RoCE 连接状态（up/down）',
+  roce_speed_status: 'RoCE 连接速度（如 100Gbps）',
+  roce_link_health: 'RoCE 链路状态',
+  pcie_tx_bandwidth: 'PCIe 发送带宽',
+  pcie_rx_bandwidth: 'PCIe 接收带宽',
+  hccs_tx_bandwidth: 'HCCS 发送带宽（卡间高速互联）',
+  hccs_rx_bandwidth: 'HCCS 接收带宽（卡间高速互联）',
+  card_drop: 'NPU 卡掉线状态，1=掉卡 0=正常',
+  mac_tx_mac_pause_num: 'MAC 发送 pause 帧数',
+  mac_rx_mac_pause_num: 'MAC 接收 pause 帧数',
+  mac_tx_pfc_pkt_num: 'MAC 发送 PFC 帧总数（优先级流量控制）',
+  mac_tx_pfc_pri0_pkt_num: 'MAC 0 号队列发送 PFC 帧数',
+  mac_tx_pfc_pri1_pkt_num: 'MAC 1 号队列发送 PFC 帧数',
+  mac_tx_pfc_pri2_pkt_num: 'MAC 2 号队列发送 PFC 帧数',
+  mac_tx_pfc_pri3_pkt_num: 'MAC 3 号队列发送 PFC 帧数',
+  mac_tx_pfc_pri4_pkt_num: 'MAC 4 号队列发送 PFC 帧数',
+  mac_tx_pfc_pri5_pkt_num: 'MAC 5 号队列发送 PFC 帧数',
+  mac_tx_pfc_pri6_pkt_num: 'MAC 6 号队列发送 PFC 帧数',
+  mac_tx_pfc_pri7_pkt_num: 'MAC 7 号队列发送 PFC 帧数',
+  mac_rx_pfc_pkt_num: 'MAC 接收 PFC 帧总数（优先级流量控制）',
+  mac_rx_pfc_pri0_pkt_num: 'MAC 0 号队列接收 PFC 帧数',
+  mac_rx_pfc_pri1_pkt_num: 'MAC 1 号队列接收 PFC 帧数',
+  mac_rx_pfc_pri2_pkt_num: 'MAC 2 号队列接收 PFC 帧数',
+  mac_rx_pfc_pri3_pkt_num: 'MAC 3 号队列接收 PFC 帧数',
+  mac_rx_pfc_pri4_pkt_num: 'MAC 4 号队列接收 PFC 帧数',
+  mac_rx_pfc_pri5_pkt_num: 'MAC 5 号队列接收 PFC 帧数',
+  mac_rx_pfc_pri6_pkt_num: 'MAC 6 号队列接收 PFC 帧数',
+  mac_rx_pfc_pri7_pkt_num: 'MAC 7 号队列接收 PFC 帧数',
+  mac_tx_total_pkt_num: 'MAC 发送总报文数',
+  mac_tx_total_oct_num: 'MAC 发送总字节数',
+  mac_tx_bad_pkt_num: 'MAC 发送坏包数',
+  mac_tx_bad_oct_num: 'MAC 发送坏包字节数',
+  mac_rx_total_pkt_num: 'MAC 接收总报文数',
+  mac_rx_total_oct_num: 'MAC 接收总字节数',
+  mac_rx_bad_pkt_num: 'MAC 接收坏包数',
+  mac_rx_bad_oct_num: 'MAC 接收坏包字节数',
+  mac_rx_fcs_err_pkt_num: 'MAC 接收 FCS 校验错误报文数',
+  roce_rx_rc_pkt_num: 'ROCE 接收 RC 类型报文数',
+  roce_rx_all_pkt_num: 'ROCE 接收总报文数',
+  roce_rx_err_pkt_num: 'ROCE 接收坏包数',
+  roce_tx_rc_pkt_num: 'ROCE 发送 RC 类型报文数',
+  roce_tx_all_pkt_num: 'ROCE 发送总报文数',
+  roce_tx_err_pkt_num: 'ROCE 发送坏包数',
+  roce_cqe_num: 'ROCE 任务完成总元素个数',
+  roce_rx_cnp_pkt_num: 'ROCE 接收 CNP 类型报文数（拥塞通知）',
+  roce_tx_cnp_pkt_num: 'ROCE 发送 CNP 类型报文数（拥塞通知）',
+  roce_unexpected_ack_num: 'ROCE 接收非预期 ACK 报文数',
+  roce_out_of_order_num: 'ROCE 接收乱序或重复报文数',
+  roce_verification_err_num: 'ROCE 接收校验错误报文数',
+  roce_qp_status_err_num: 'ROCE 接收 QP 状态异常报文数',
+  roce_new_pkt_rty_num: 'ROCE 接收重传报文数',
+  roce_ecn_db_num: 'ROCE ECN 标记丢弃计数',
+  nic_tx_all_pkg_num: 'NIC 发送总报文数',
+  nic_tx_all_oct_num: 'NIC 发送总字节数',
+  nic_rx_all_pkg_num: 'NIC 接收总报文数',
+  nic_rx_all_oct_num: 'NIC 接收总字节数',
+  // Network
+  'network:throughput': '网络吞吐量',
+  packet_count: '包收发速率',
+  error_count: '错误包计数（丢包/错包）',
+  interface_status: '网卡接口状态（up/down）',
+  connection_count: 'TCP 连接数（按状态统计）',
+  rx_bytes_total: '接收字节累计值',
+  tx_bytes_total: '发送字节累计值',
+  // Chassis
+  inlet_temp: '进风口温度',
+  outlet_temp: '出风口温度',
+  fan_power: '风扇功率',
 };
 
 const NAV_ORDER = ['cpu', 'memory', 'disk', 'gpu', 'npu', 'network'];
@@ -368,21 +594,309 @@ function renderSpaceDetailGroup(items) {
     const total = d.total ? fmtMB(d.total) : '--';
     const used = d.used ? fmtMB(d.used) : '--';
     const avail = d.available ? fmtMB(d.available) : '--';
-    const pct = (d.total && d.used) ? Math.round(d.used / d.total * 100) : 0;
+    const availPct = d.total > 0 ? (d.available / d.total * 100) : 100;
+    const availColor = availPct < 10 ? ' style="color:var(--crit)"' : '';
     const row = el('div', 'metric-row space-detail-row');
     row.innerHTML =
       '<span class="metric-val">' + total + '</span>' +
       '<span class="space-detail-used">' + used + ' used</span>' +
-      '<span class="space-detail-avail">' + avail + ' avail</span>' +
+      '<span class="space-detail-avail"' + availColor + '>' + avail + ' avail</span>' +
       '<span class="metric-labels">' + (d.device || '--') + ' → ' + (d.mount_point || '--') + (d.fstype ? ' (' + d.fstype + ')' : '') + '</span>';
     container.appendChild(row);
   }
   return container;
 }
+
+function parentPciAddr(addr) {
+  if (!addr) return '';
+  var parts = addr.split(':');
+  if (parts.length < 3) return addr;
+  var devFunc = parts[2];
+  var devOnly = devFunc.split('.')[0];
+  return parts[0] + ':' + parts[1] + ':' + devOnly;
+}
+
+function renderNetworkCardGroup(specs) {
+  var netSpecs = specs.filter(function(m) { return m.name === 'net_info'; });
+  if (netSpecs.length === 0) return null;
+
+  var groups = {};
+  var order = [];
+  for (var i = 0; i < netSpecs.length; i++) {
+    var m = netSpecs[i];
+    var lb = m.labels || {};
+    var parent = parentPciAddr(lb.pci_addr || '');
+    var key = parent || ('no_pci_' + (lb.interface || ''));
+    if (!groups[key]) { groups[key] = { ports: [], device: '', pciBase: parent }; order.push(key); }
+    groups[key].ports.push(lb);
+    if (lb.pci_device) groups[key].device = lb.pci_device;
+  }
+  order.sort(function(a, b) { return (groups[a].pciBase || '') < (groups[b].pciBase || '') ? -1 : 1; });
+
+  var container = el('div');
+
+  var title = el('div', 'metric-group-head');
+  title.style.cursor = 'default';
+  title.innerHTML = '<span class="metric-group-name">网络 (' + order.length + ')</span>';
+  container.appendChild(title);
+
+  var body = el('div', 'metric-group-body');
+  for (var i = 0; i < order.length; i++) {
+    var g = groups[order[i]];
+    var deviceName = g.device || g.pciBase || g.ports[0].driver || g.ports[0].interface || '未知设备';
+    var cardHead = el('div', 'metric-row');
+    cardHead.style.fontWeight = '600';
+    cardHead.style.marginTop = '4px';
+    cardHead.innerHTML = '<span class="metric-val">' + deviceName + '</span>' +
+      '<span class="metric-labels">' + (g.pciBase && g.device ? 'PCI: ' + g.pciBase : '') + '</span>';
+    body.appendChild(cardHead);
+
+    for (var j = 0; j < g.ports.length; j++) {
+      var p = g.ports[j];
+      var speedStr = p.speed && p.speed !== '-1' ? p.speed + 'Mb/s' : '--';
+      var row = el('div', 'metric-row');
+      row.style.paddingLeft = '16px';
+      row.innerHTML = '<span class="metric-labels">' +
+        '接口: ' + (p.interface || '--') +
+        (p.pci_addr ? '  PCI: ' + p.pci_addr : '') +
+        '  MAC: ' + (p.mac || '--') +
+        '  MTU: ' + (p.mtu || '--') +
+        '  速率: ' + speedStr +
+        '  驱动: ' + (p.driver || '--') +
+        '</span>';
+      body.appendChild(row);
+    }
+  }
+  container.appendChild(body);
+  return container;
+}
+
+var networkFSTypes = { 'nfs': true, 'nfs4': true, 'cifs': true, 'smb': true, 'fuse.sshfs': true, 'fuse.glusterfs': true };
+
+function diskTypeLabel(device, model) {
+  var dev = (device || '').replace('/dev/', '');
+  if (dev.indexOf('nvme') === 0) return 'NVMe SSD';
+  if ((model || '').toUpperCase().indexOf('RAID') >= 0) return 'RAID 逻辑盘';
+  if (dev.indexOf('sd') === 0) return 'SAS/SATA 硬盘';
+  return '硬盘';
+}
+
+function renderDiskGroup(specs) {
+  var diskSpecs = specs.filter(function(m) { return m.name === 'disk_info'; });
+  if (diskSpecs.length === 0) return null;
+
+  var container = el('div');
+
+  var title = el('div', 'metric-group-head');
+  title.style.cursor = 'default';
+  title.innerHTML = '<span class="metric-group-name">硬盘 (' + diskSpecs.length + ')</span>';
+  container.appendChild(title);
+
+  var body = el('div', 'metric-group-body');
+
+  var grid = el('div', 'disk-grid');
+  var headers = ['设备', '类型', '容量', '型号', '序列号', '固件', '接口'];
+  for (var h = 0; h < headers.length; h++) {
+    var hh = el('div', 'disk-grid-h');
+    hh.textContent = headers[h];
+    grid.appendChild(hh);
+  }
+  for (var i = 0; i < diskSpecs.length; i++) {
+    var m = diskSpecs[i];
+    var lb = m.labels || {};
+    var dev = lb.device || '--';
+    var model = lb.model || '--';
+    var serial = lb.serial || '--';
+    var typeLabel = diskTypeLabel(dev, model);
+    var sizeStr = m.value > 0 ? fmtGB(m.value) : '--';
+    if (model !== '--' && serial !== '--' && model === serial) serial = '--';
+
+    var cells = [
+      '/dev/' + dev, typeLabel, sizeStr, model, serial,
+      lb.firmware || '--', lb.interface || '--'
+    ];
+    for (var c = 0; c < cells.length; c++) {
+      var cell = el('div', c === 0 ? 'disk-grid-val-bold' : 'disk-grid-val');
+      cell.textContent = cells[c];
+      grid.appendChild(cell);
+    }
+  }
+  body.appendChild(grid);
+  container.appendChild(body);
+  return container;
+}
+
+function parentDisk(device) {
+  var dev = (device || '').replace('/dev/', '');
+  if (/^nvme\d+n\d+p\d+$/.test(dev)) return dev.replace(/p\d+$/, '');
+  if (/^(sd|vd|xvd)[a-z]+\d+$/.test(dev)) return dev.replace(/\d+$/, '');
+  if (dev.indexOf('mapper/') === 0) return '/dev/' + dev;
+  return dev;
+}
+
+function classifySpaceMetrics(metrics) {
+  var local = [], network = [];
+  for (var i = 0; i < metrics.length; i++) {
+    var m = metrics[i];
+    var lb = m.labels || {};
+    if (networkFSTypes[lb.fstype] || !(lb.device || '').startsWith('/dev/')) {
+      network.push(m);
+    } else {
+      local.push(m);
+    }
+  }
+  return { local: local, network: network };
+}
+
+function aggregateByPhysicalDisk(spaceDetailMetrics, spaceUsageMetrics) {
+  var groups = {};
+  var order = [];
+  for (var i = 0; i < spaceDetailMetrics.length; i++) {
+    var m = spaceDetailMetrics[i];
+    var lb = m.labels || {};
+    var pd = parentDisk(lb.device || '');
+    if (!groups[pd]) { groups[pd] = { parts: {}, total: 0, used: 0, avail: 0 }; order.push(pd); }
+    groups[pd].parts[lb.device || ''] = true;
+    if (lb.field === 'total') groups[pd].total += m.value;
+    if (lb.field === 'used') groups[pd].used += m.value;
+    if (lb.field === 'available') groups[pd].avail += m.value;
+  }
+  for (var i = 0; i < spaceUsageMetrics.length; i++) {
+    var m = spaceUsageMetrics[i];
+    var lb = m.labels || {};
+    var pd = parentDisk(lb.device || '');
+    if (groups[pd]) groups[pd].usage = m.value;
+  }
+  order.sort(function(a, b) {
+    var na = parseInt(a.replace(/\D/g, ''), 10);
+    var nb = parseInt(b.replace(/\D/g, ''), 10);
+    if (!isNaN(na) && !isNaN(nb)) return na - nb;
+    return a < b ? -1 : 1;
+  });
+  return order.map(function(pd) { return Object.assign({ disk: pd, parts: Object.keys(groups[pd].parts) }, groups[pd]); });
+}
+
+function isPhysicalDiskDevice(device) {
+  var dev = (device || '').replace('/dev/', '');
+  if (dev.indexOf('mapper/') === 0 || dev.indexOf('dm-') === 0) return false;
+  if (/^(sd|vd|xvd|nvme)[a-z0-9]+$/.test(dev)) return true;
+  return false;
+}
+
+function renderPhysicalDiskGroups(localMetrics) {
+  var spaceDetail = localMetrics.filter(function(m) { return m.name === 'space_detail' && isPhysicalDiskDevice((m.labels || {}).device); });
+  var spaceUsage = localMetrics.filter(function(m) { return m.name === 'space_usage' && isPhysicalDiskDevice((m.labels || {}).device); });
+  var disks = aggregateByPhysicalDisk(spaceDetail, spaceUsage);
+  if (disks.length === 0) return null;
+
+  var container = el('div');
+
+  var usageTitle = el('div', 'metric-group-head');
+  usageTitle.style.cursor = 'default';
+  usageTitle.innerHTML = '<span class="metric-group-name">物理盘空间使用率</span><span class="metric-group-count">' + disks.length + ' 条</span>';
+  container.appendChild(usageTitle);
+  var usageBody = el('div', 'metric-group-body');
+  for (var i = 0; i < disks.length; i++) {
+    var d = disks[i];
+    var pct = d.total > 0 ? Math.round(d.used / d.total * 100 * 100) / 100 : 0;
+    var row = el('div', 'metric-row space-detail-row');
+    row.innerHTML = '<span class="metric-val">' + pct + ' %</span>' +
+      '<span class="metric-labels">' + d.disk + (d.parts.length > 1 ? ' (' + d.parts.join(', ') + ')' : '') + '</span>';
+    usageBody.appendChild(row);
+  }
+  container.appendChild(usageBody);
+
+  var detailTitle = el('div', 'metric-group-head');
+  detailTitle.style.cursor = 'default';
+  detailTitle.innerHTML = '<span class="metric-group-name">物理盘空间明细</span><span class="metric-group-count">' + disks.length + ' 条</span>';
+  container.appendChild(detailTitle);
+  var detailBody = el('div', 'metric-group-body');
+  for (var i = 0; i < disks.length; i++) {
+    var d = disks[i];
+    var total = d.total > 0 ? fmtMB(d.total) : '--';
+    var used = d.total > 0 ? fmtMB(d.used) : '--';
+    var avail = d.avail > 0 ? fmtMB(d.avail) : '--';
+    var row = el('div', 'metric-row space-detail-row');
+    row.innerHTML = '<span class="metric-val">' + total + '</span>' +
+      '<span class="space-detail-used">' + used + ' used</span>' +
+      '<span class="space-detail-avail">' + avail + ' avail</span>' +
+      '<span class="metric-labels">' + d.disk + (d.parts.length > 1 ? ' (' + d.parts.join(', ') + ')' : '') + '</span>';
+    detailBody.appendChild(row);
+  }
+  container.appendChild(detailBody);
+
+  return container;
+}
+
+function renderNetworkStorageGroup(networkMetrics) {
+  var spaceUsage = networkMetrics.filter(function(m) { return m.name === 'space_usage'; });
+  var spaceDetail = networkMetrics.filter(function(m) { return m.name === 'space_detail'; });
+  if (spaceUsage.length === 0 && spaceDetail.length === 0) return null;
+
+  var byMount = {};
+  var order = [];
+  for (var i = 0; i < spaceDetail.length; i++) {
+    var m = spaceDetail[i];
+    var lb = m.labels || {};
+    var key = (lb.device || '') + '|' + (lb.mount_point || '');
+    if (!byMount[key]) { byMount[key] = { device: lb.device, mount: lb.mount_point, fstype: lb.fstype, total: 0, used: 0, avail: 0 }; order.push(key); }
+    if (lb.field === 'total') byMount[key].total = m.value;
+    if (lb.field === 'used') byMount[key].used = m.value;
+    if (lb.field === 'available') byMount[key].avail = m.value;
+  }
+  for (var i = 0; i < spaceUsage.length; i++) {
+    var m = spaceUsage[i];
+    var lb = m.labels || {};
+    var key = (lb.device || '') + '|' + (lb.mount_point || '');
+    if (byMount[key]) byMount[key].usage = m.value;
+  }
+  if (order.length === 0) return null;
+  order.sort(function(a, b) { return (byMount[a].mount || '') < (byMount[b].mount || '') ? -1 : 1; });
+
+  var container = el('div');
+
+  var usageTitle = el('div', 'metric-group-head');
+  usageTitle.style.cursor = 'default';
+  usageTitle.innerHTML = '<span class="metric-group-name">网络存储空间使用率</span><span class="metric-group-count">' + order.length + ' 条</span>';
+  container.appendChild(usageTitle);
+  var usageBody = el('div', 'metric-group-body');
+  for (var i = 0; i < order.length; i++) {
+    var d = byMount[order[i]];
+    var row = el('div', 'metric-row space-detail-row');
+    row.innerHTML = '<span class="metric-val">' + (d.usage !== undefined ? d.usage + ' %' : '--') + '</span>' +
+      '<span class="metric-labels">' + (d.device || '--') + ' → ' + (d.mount || '--') + '</span>';
+    usageBody.appendChild(row);
+  }
+  container.appendChild(usageBody);
+
+  var detailTitle = el('div', 'metric-group-head');
+  detailTitle.style.cursor = 'default';
+  detailTitle.innerHTML = '<span class="metric-group-name">网络存储空间明细</span><span class="metric-group-count">' + order.length + ' 条</span>';
+  container.appendChild(detailTitle);
+  var detailBody = el('div', 'metric-group-body');
+  for (var i = 0; i < order.length; i++) {
+    var d = byMount[order[i]];
+    var total = d.total > 0 ? fmtMB(d.total) : '--';
+    var used = d.total > 0 ? fmtMB(d.used) : '--';
+    var avail = d.avail > 0 ? fmtMB(d.avail) : '--';
+    var availPct = d.total > 0 ? (d.avail / d.total * 100) : 100;
+    var availColor = availPct < 10 ? ' style="color:var(--crit)"' : '';
+    var row = el('div', 'metric-row space-detail-row');
+    row.innerHTML = '<span class="metric-val">' + total + '</span>' +
+      '<span class="space-detail-used">' + used + ' used</span>' +
+      '<span class="space-detail-avail"' + availColor + '>' + avail + ' avail</span>' +
+      '<span class="metric-labels">' + (d.device || '--') + ' → ' + (d.mount || '--') + (d.fstype ? ' (' + d.fstype + ')' : '') + '</span>';
+    detailBody.appendChild(row);
+  }
+  container.appendChild(detailBody);
+
+  return container;
+}
+
 // ---- state ----
 let collectors = [];
 let lastSnapshot = null;
-let refreshIntervalMs = 5000;
+let refreshIntervalMs = 3000;
 let pollTimer = null;
 let autoOn = true;
 let appVersion = '';
@@ -596,6 +1110,8 @@ function renderNav() {
     if (route === c.component) a.className = 'active';
     nav.appendChild(a);
   }
+  const aStress = el('a'); aStress.href = '/stress/'; aStress.textContent = '可靠性压测';
+  nav.appendChild(aStress);
 }
 
 // specSummary returns a one-line identity string for a component's overview
@@ -713,6 +1229,12 @@ function openSpecsModal(snap) {
     if (groups[comp] && groups[comp].length) {
       if (comp === 'memory') {
         body.appendChild(specsGroupMemory(groups[comp]));
+      } else if (comp === 'network') {
+        var netGroup = renderNetworkCardGroup(groups[comp]);
+        if (netGroup) body.appendChild(netGroup);
+      } else if (comp === 'disk') {
+        var diskGroup = renderDiskGroup(groups[comp]);
+        if (diskGroup) body.appendChild(diskGroup);
       } else {
         body.appendChild(specsGroup(comp, groups[comp]));
       }
@@ -730,14 +1252,21 @@ function openSpecsModal(snap) {
 // specsGroup renders one component's static specs as a titled table
 // (类型 / 标识 / 明细). Synthetic entries (mem_total) get a friendly type.
 function specsGroup(comp, arr) {
+  const sorted = comp === 'cpu' ? arr.slice().sort(function(a, b) {
+    var ia = CPU_SPEC_ORDER[a.name], ib = CPU_SPEC_ORDER[b.name];
+    if (ia === undefined) ia = 99;
+    if (ib === undefined) ib = 99;
+    if (ia !== ib) return ia - ib;
+    return (a.name < b.name) ? -1 : 1;
+  }) : arr;
   const sec = el('div', 'specs-group');
   const title = comp === 'system' ? '系统' : compTitle(comp);
-  sec.appendChild(elText('div', 'specs-group-title', title + ' (' + arr.length + ')'));
+  sec.appendChild(elText('div', 'specs-group-title', title + ' (' + sorted.length + ')'));
   const tbl = document.createElement('table');
   tbl.className = 'table';
   tbl.innerHTML = '<thead><tr><th>类型</th><th>标识</th><th>明细</th></tr></thead>';
   const tb = document.createElement('tbody');
-  for (const m of arr) {
+  for (const m of sorted) {
     const def = SPEC_DEFS[m.name] || { type: (METRIC_NAMES[m.name] || m.name), primary: '' };
     const lb = m.labels || {};
     // Identity specs carry their main value in a label (def.primary); synthetic
@@ -770,6 +1299,12 @@ function specsGroup(comp, arr) {
 
 function specsGroupMemory(specs) {
   const sec = el('div', 'specs-group');
+  const totalDimms = specs.filter(m => m.name === 'module_size' || m.name === 'module_info').length;
+  const dimmCount = new Set(specs.filter(m => m.name === 'module_size' || m.name === 'module_info').map(m => (m.labels||{}).locator||'')).size;
+  const titleDiv = el('div', 'metric-group-head');
+  titleDiv.style.cursor = 'default';
+  titleDiv.innerHTML = '<span class="metric-group-name">内存 (' + dimmCount + ')</span>';
+  sec.appendChild(titleDiv);
   const tbl = document.createElement('table');
   tbl.className = 'table';
   tbl.innerHTML = '<thead><tr><th>插槽</th><th>容量</th><th>类型</th><th>速率</th><th>厂商</th></tr></thead>';
@@ -903,24 +1438,42 @@ function summaryCard(compKey, snap) {
   card.appendChild(head);
 
   const body = el('div', 'card-body');
+  var sparklineShown = false;
   if (m.headline && snap.history && snap.history[m.headline] && snap.history[m.headline].length > 1) {
-    body.appendChild(elText('div', 'spark-label', m.headlineLabel || ''));
-    body.appendChild(sparkline(snap.history[m.headline], st.color));
+    sparklineShown = true;
+    const histData = snap.history[m.headline];
+    const curVal = histData[histData.length - 1];
+    const meanVal = statBounds(histData).mean;
+    const labelDiv = el('div', 'spark-label');
+    labelDiv.innerHTML = '<span>' + (m.headlineLabel || '') + '</span>' +
+      '<span class="spark-vals"><span class="spark-cur" style="color:' + st.color + '">当前 ' + fmt(curVal) + '</span>' +
+      '<span class="spark-mean">均值 ' + fmt(meanVal) + '</span></span>';
+    body.appendChild(labelDiv);
+    body.appendChild(sparkline(histData, st.color));
   }
   if (metrics.length === 0) {
     body.appendChild(elText('div', 'empty', '无数据'));
   } else {
     const kv = el('div', 'kv');
     const keys = m.key || metrics.slice(0, 4).map(x => x.name);
+    const headlineMetric = sparklineShown && m.headline ? m.headline.replace(/^[a-z]+_/, '') : '';
     for (const spec of keys) {
       const mm = pickMetric(metrics, spec);
       if (!mm) continue;
+      if (mm.name === headlineMetric) continue;
       kv.appendChild(elText('div', 'k', METRIC_NAMES[mm.name] || mm.name));
       const v = el('div', 'v');
       if (mm.name === 'smart_status') {
         v.textContent = mm.value >= 1 ? 'PASSED' : 'FAILED';
       } else if (mm.name === 'interface_status') {
         v.textContent = mm.value > 0 ? 'up' : 'down';
+      } else if (mm.name === 'health_status') {
+        const statusMap = {1: 'OK', 2: 'Warning', 3: 'Alarm', 4: 'Critical'};
+        v.textContent = statusMap[mm.value] || '--';
+      } else if (mm.name === 'driver_health') {
+        v.textContent = mm.value === 0 ? '正常' : '异常';
+      } else if (mm.name === 'error_code') {
+        v.textContent = mm.value === 0 ? '无' : ((mm.labels || {}).error_codes || String(mm.value));
       } else {
         v.textContent = fmt(mm.value) + ' ' + (mm.unit || '');
       }
@@ -1005,6 +1558,12 @@ function renderDetail(compKey, snap) {
     const sbody = el('div', 'panel-body');
     if (compKey === 'memory') {
       sbody.appendChild(specsGroupMemory(compSpecs));
+    } else if (compKey === 'network') {
+      var netCardGroup = renderNetworkCardGroup(compSpecs);
+      if (netCardGroup) sbody.appendChild(netCardGroup);
+    } else if (compKey === 'disk') {
+      var diskGroup = renderDiskGroup(compSpecs);
+      if (diskGroup) sbody.appendChild(diskGroup);
     } else {
       sbody.appendChild(specsGroup(compKey, compSpecs));
     }
@@ -1043,9 +1602,18 @@ function renderDetail(compKey, snap) {
   if (metrics.length === 0) {
     mbody.appendChild(elText('div', 'empty', '无数据（采集器不可用或无硬件）'));
   } else {
+    var diskNetMetrics = null;
+    if (compKey === 'disk') {
+      var classified = classifySpaceMetrics(metrics);
+      diskNetMetrics = classified.network;
+    }
     const groups = {};
     const order = [];
     for (const mt of metrics) {
+      if (compKey === 'disk' && (mt.name === 'space_usage' || mt.name === 'space_detail')) {
+        var lb = mt.labels || {};
+        if (networkFSTypes[lb.fstype] || !(lb.device || '').startsWith('/dev/')) continue;
+      }
       if (!groups[mt.name]) { groups[mt.name] = []; order.push(mt.name); }
       groups[mt.name].push(mt);
     }
@@ -1058,6 +1626,8 @@ function renderDetail(compKey, snap) {
       const gh = el('div', 'metric-group-head');
       const groupKey = compKey + ':' + name;
       const collapsed = localStorage.getItem('mg:' + groupKey) === '1';
+      const desc = METRIC_DESCRIPTIONS[compKey + ':' + name] || METRIC_DESCRIPTIONS[name] || '';
+      gh.title = desc;
       gh.innerHTML = '<span class="metric-group-name">' + dispName + '</span>' +
         (unit ? '<span class="metric-group-unit">(' + unit + ')</span>' : '') +
         '<span class="metric-group-count">' + items.length + ' 条</span>' +
@@ -1084,9 +1654,32 @@ function renderDetail(compKey, snap) {
         for (const mt of items) {
           const labels = mt.labels ? Object.entries(mt.labels).map(([k, v]) => k + '=' + v).join(', ') : '';
           const row = el('div', 'metric-row');
+          let valStr;
+          if (mt.name === 'health_status') {
+            const statusMap = {1: 'OK', 2: 'Warning', 3: 'Alarm', 4: 'Critical'};
+            const statusColor = {1: 'var(--ok)', 2: 'var(--warn)', 3: 'var(--crit)', 4: 'var(--crit)'};
+            const statusText = statusMap[mt.value] || '--';
+            valStr = '<span style="color:' + (statusColor[mt.value] || 'var(--muted)') + ';font-weight:600">' + statusText + '</span>';
+          } else if (mt.name === 'driver_health') {
+            valStr = mt.value === 0
+              ? '<span style="color:var(--ok);font-weight:600">正常</span>'
+              : '<span style="color:var(--crit);font-weight:600">异常</span>';
+          } else if (mt.name === 'error_code') {
+            if (mt.value === 0) {
+              valStr = '<span style="color:var(--ok)">无</span>';
+            } else {
+              const codes = (mt.labels || {}).error_codes || '';
+              valStr = '<span style="color:var(--crit);font-weight:600">' + codes + '</span>';
+            }
+          } else {
+            valStr = fmt(mt.value) + (mt.unit ? ' ' + mt.unit : '');
+          }
+          const cleanLabels = mt.labels ? Object.entries(mt.labels)
+            .filter(([k]) => !(mt.name === 'error_code' && k === 'error_codes'))
+            .map(([k, v]) => k + '=' + v).join(', ') : '';
           row.innerHTML =
-            '<span class="metric-val">' + fmt(mt.value) + (mt.unit ? ' ' + mt.unit : '') + '</span>' +
-            '<span class="metric-labels">' + labels + '</span>';
+            '<span class="metric-val">' + valStr + '</span>' +
+            '<span class="metric-labels">' + cleanLabels + '</span>';
           gb.appendChild(row);
         }
       }
@@ -1099,6 +1692,10 @@ function renderDetail(compKey, snap) {
       grp.appendChild(gh);
       grp.appendChild(gb);
       mbody.appendChild(grp);
+      if (compKey === 'disk' && name === 'space_detail' && diskNetMetrics && diskNetMetrics.length > 0) {
+        var netGroup = renderNetworkStorageGroup(diskNetMetrics);
+        if (netGroup) mbody.appendChild(netGroup);
+      }
     }
   }
   mpanel.appendChild(mbody);
@@ -1143,7 +1740,6 @@ async function fetchConfigData() {
     const r = await fetch('/api/config', { cache: 'no-store' });
     if (!r.ok) return;
     const c = await r.json();
-    refreshIntervalMs = c.refresh_interval_ms || 5000;
     document.getElementById('intervalInput').value = Math.round(refreshIntervalMs / 1000);
     if (c.version) {
       appVersion = c.version;
