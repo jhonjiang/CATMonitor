@@ -112,12 +112,12 @@ energysave:
 nputurbo:
   enabled: false
   interval: 60s
-  straggler_url: "http://127.0.0.1:8080/straggler/result"   # GET → profiler doc (kpi block ignored)
+  straggler_url: "http://127.0.0.1:15432/straggler/result"   # GET → profiler doc (kpi block ignored)
   straggler_timeout: 10s                                    # HTTP GET timeout
-  npu_turbo_cmd: "/home/jw/npu_turbo_one.sh inject -n {id} -f {freq}"
+  npu_turbo_cmd: "/home/jw/npu_turbo_one.sh inject -d {id} -f {freq}"
   npu_turbo_clean_cmd: "/home/jw/npu_turbo_one.sh clean"
   npu_turbo_timeout: 120s
   max_freq_mhz: 1900
   step_mhz: 50
-  dry_run: true
+  dry_run: false
   restore_on_shutdown: true
