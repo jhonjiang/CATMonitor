@@ -1,0 +1,13 @@
+# nputurbo feature scope: the actuator state metrics (observability) it emits.
+# A (the boost-formula baseline) is the fixed constant fixedCurrentMHz=1800;
+# nputurbo no longer reads npu.aicore_freq from snapshot, so it does not scope
+# aicore_freq as an input.
+components:
+  - component: nputurbo
+    metrics:
+      - name: boost_active
+        priority: High
+      - name: boost_count
+        priority: High
+      - name: actuator_ok
+        priority: High

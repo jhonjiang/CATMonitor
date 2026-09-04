@@ -22,6 +22,8 @@ type Config struct {
 	FaultSub        FaultSubConfig          `yaml:"faultsub"`
 	StragglerOutput StragglerOutputConfig   `yaml:"straggler_output"`
 	Snapshot        SnapshotConfig          `yaml:"snapshot"`
+	Energysave      EnergysaveConfig        `yaml:"energysave"`
+	Nputurbo        NputurboConfig          `yaml:"nputurbo"`
 }
 
 // ServerConfig holds server-level configuration.
@@ -99,6 +101,39 @@ type SnapshotConfig struct {
 	Dir     string `yaml:"dir"` // directory for snapshot_<comp>.json + snapshot.json
 }
 
+// EnergysaveConfig holds the cpugov (CPU-senses-NPU) actuator configuration
+// (SPEC: features/cpugov/cpugov_SPEC.md). Writes to sysfs require root; the
+// feature is off by default and starts in dry_run (read-only) mode.
+type EnergysaveConfig struct {
+	Enabled             bool          `yaml:"enabled"`                // default false
+	Interval            time.Duration `yaml:"interval"`               // control loop period
+	CpuIdleThresholdPct float64       `yaml:"cpu_idle_threshold_pct"` // idle% >= this => idle sample
+	ObserveWindow       time.Duration `yaml:"observe_window"`         // x seconds sustained idle to confirm
+	NonIdleBreak        int           `yaml:"non_idle_break"`         // consecutive non-idle to abort
+	DryRun              bool          `yaml:"dry_run"`                // true = judge+log only, no sysfs write
+	MinFreqOverride     uint64        `yaml:"min_freq_override"`      // 0 = use cpuinfo_min_freq
+	NpuStaleSec         int           `yaml:"npu_stale_sec"`          // NPU data staleness threshold (sec)
+}
+
+// NputurboConfig holds the NPU slow-card upclock actuator (nputurbo)
+// configuration (SPEC: features/nputurbo/nputurbo_SPEC.md). The slow-card
+// result is fetched via HTTP GET straggler_url (no local exec, no snapshot
+// read); the feature is off by default and starts in dry_run (judge+log)
+// mode. A is the fixed constant 1800 (not queried).
+type NputurboConfig struct {
+	Enabled           bool          `yaml:"enabled"`             // default false
+	Interval          time.Duration `yaml:"interval"`            // control loop period (HTTP poll cadence)
+	StragglerURL      string        `yaml:"straggler_url"`       // HTTP GET endpoint returning the slow-card result (profiler doc)
+	StragglerTimeout  time.Duration `yaml:"straggler_timeout"`   // HTTP GET timeout
+	NpuTurboCmd       string        `yaml:"npu_turbo_cmd"`       // inject command template; {id}/{freq} replaced
+	NpuTurboCleanCmd  string        `yaml:"npu_turbo_clean_cmd"` // clean command (restores all cards); run as-is
+	NpuTurboTimeout   time.Duration `yaml:"npu_turbo_timeout"`   // npu_turbo exec timeout
+	MaxFreqMhz        int           `yaml:"max_freq_mhz"`        // M (hard cap on boost target)
+	StepMhz           int           `yaml:"step_mhz"`            // boost target quantization step
+	DryRun            bool          `yaml:"dry_run"`             // true = judge+log only, no npu_turbo exec
+	RestoreOnShutdown bool          `yaml:"restore_on_shutdown"` // restore boosted freqs on graceful shutdown
+}
+
 // Default returns the default configuration.
 func Default() *Config {
 	return &Config{
@@ -143,6 +178,29 @@ func Default() *Config {
 		Snapshot: SnapshotConfig{
 			Enabled: false, // opt-in; daemon unchanged when off
 			Dir:     platform.DataDir() + "/snapshot",
+		},
+		Energysave: EnergysaveConfig{
+			Enabled:             false,
+			Interval:            3 * time.Second,
+			CpuIdleThresholdPct: 97,
+			ObserveWindow:       120 * time.Second,
+			NonIdleBreak:        2,
+			DryRun:              true,
+			MinFreqOverride:     0,
+			NpuStaleSec:         6,
+		},
+		Nputurbo: NputurboConfig{
+			Enabled:           false,
+			Interval:          60 * time.Second,
+			StragglerURL:      "",
+			StragglerTimeout:  10 * time.Second,
+			NpuTurboCmd:       "/home/jw/npu_turbo_one.sh inject -n {id} -f {freq}",
+			NpuTurboCleanCmd:  "/home/jw/npu_turbo_one.sh clean",
+			NpuTurboTimeout:   120 * time.Second,
+			MaxFreqMhz:        1900,
+			StepMhz:           50,
+			DryRun:            true,
+			RestoreOnShutdown: true,
 		},
 	}
 }

@@ -49,6 +49,10 @@ func main() {
 		runCollect()
 	case "health":
 		runHealth()
+	case "energysave":
+		runEnergysave()
+	case "nputurbo":
+		runNputurbo()
 	case "stress":
 		if code := stresscli.Run(os.Args[2:], setupLogger(), os.Stdout, os.Stderr); code != 0 {
 			os.Exit(code)
@@ -72,6 +76,8 @@ Commands:
   daemon       Start daemon process (default)
   collect      Collect metrics once and print
   health       Run health check and print report
+  energysave   Print CPU/NPU idle status preview (read-only)
+  nputurbo     Print NPU slow-card upclock plan (read-only preview)
   stress       Run an explicit stress benchmark job
   list         List all registered collectors
   version      Show version information
@@ -290,6 +296,12 @@ func runDaemon() {
 
 	scheduler.Start(ctx, collectorCfgs)
 
+	// Energysave controller (cpugov): taps the scheduler for latest cpu/npu
+	// metrics and pins CPU frequencies when both are idle. No-op when the
+	// feature is disabled or cpufreq is unavailable.
+	startEnergysave(ctx, cfg, scheduler, sink, logger)
+	startNputurbo(ctx, cfg, sink, logger)
+
 	// Wait for shutdown signal
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
@@ -297,6 +309,8 @@ func runDaemon() {
 	sig := <-sigCh
 	logger.Info("received signal, shutting down", "signal", sig)
 	cancel()
+	stopEnergysave()
+	stopNputurbo()
 	scheduler.Stop()
 }
 
@@ -327,6 +341,18 @@ func runCollect() {
 	} else {
 		printMetricsJSON(allMetrics)
 	}
+}
+
+func runEnergysave() {
+	cfg := loadConfig()
+	logger := setupLogger()
+	runEnergysaveCLI(cfg, logger)
+}
+
+func runNputurbo() {
+	cfg := loadConfig()
+	logger := setupLogger()
+	runNputurboCLI(cfg, logger)
 }
 
 func runHealth() {

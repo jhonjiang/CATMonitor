@@ -59,8 +59,11 @@ func (c *NPUCollector) Collect() ([]collector.Metric, error) {
 		}
 	}
 
-	// Phase 2: per-device metrics (parallel).
-	if len(c.devices) > 0 && collector.AnyWanted("npu", []string{"utilization", "memory_usage", "temperature", "power_draw", "voltage", "aicore_freq", "hbm_freq", "npu_util", "vector_core_util", "hbm_bandwidth_util", "ecc_errors", "fan_speed"}) {
+	// Phase 2: per-device metrics (parallel). process_total/process_info are
+	// listed so a cpugov-only feature scope still collects the NPU
+	// process-presence input (energysave); otherwise the gate would skip
+	// collectDevice entirely and cpugov would never see npu_known=true.
+	if len(c.devices) > 0 && collector.AnyWanted("npu", []string{"utilization", "memory_usage", "temperature", "power_draw", "voltage", "aicore_freq", "hbm_freq", "npu_util", "vector_core_util", "hbm_bandwidth_util", "ecc_errors", "fan_speed", "process_total", "process_info"}) {
 		var wg sync.WaitGroup
 		results := make([][]collector.Metric, len(c.devices))
 		for i, d := range c.devices {
