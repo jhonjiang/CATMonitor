@@ -69,6 +69,12 @@ func stopEnergysave() {
 // once (cpu twice to establish a delta), classify, and print a read-only
 // status preview. Never writes sysfs.
 func runEnergysaveCLI(cfg *config.Config, logger *slog.Logger) {
+	// Mirror the daemon's collection setup so the preview classifies with the
+	// same scope/threshold semantics (and skips out-of-scope exec-heavy
+	// sub-collections like hccn_tool, keeping npu.process_total fresh).
+	metrics.SetCollectionThreshold(cfg.Collection.MinPriority)
+	collector.SetWantedChecker(metrics.AnyWanted)
+
 	// CPU usage needs a prev/curr delta. Warm up the cpu collector once,
 	// wait, then collect the real sample.
 	warmCPU := collectorFor(compCPU)
@@ -78,9 +84,16 @@ func runEnergysaveCLI(cfg *config.Config, logger *slog.Logger) {
 	time.Sleep(time.Second)
 
 	var batch []collector.Metric
-	for _, c := range collector.DefaultRegistry.All() {
-		switch c.Component() {
-		case "cpu", "npu":
+	// Collect npu BEFORE cpu: npu collection can take seconds (DCMI/hccn_tool),
+	// while cpu.usage is the freshness-sensitive input (staleness window is
+	// 2*interval). Collecting cpu last keeps its timestamp fresh for RunOnce's
+	// classification. Registry.All() is name-sorted (cpu before npu), so run
+	// two explicit passes in this order.
+	for _, comp := range []string{"npu", "cpu"} {
+		for _, c := range collector.DefaultRegistry.All() {
+			if c.Component() != comp {
+				continue
+			}
 			collected, err := c.Collect()
 			if err != nil {
 				continue
