@@ -8,13 +8,20 @@ import (
 	"testing"
 )
 
-// fakeTurbo implements npu_turbo.Source; it records inject (id,freq) pairs and
-// a clean count, and returns a configurable output string. The real source
-// substitutes {id}/{freq} internally and returns combined stdout+stderr, so
-// the fake returns a synthetic output to exercise the actuator's logging.
+// injectCall is one recorded inject: the card id, target freq, and rated
+// freq as passed to the source's SetFreq.
+type injectCall struct {
+	id, freq, rated int
+}
+
+// fakeTurbo implements npu_turbo.Source; it records inject calls and a clean
+// count, and returns a configurable output string. The real source
+// substitutes {id}/{freq}/{rated} internally and returns combined
+// stdout+stderr, so the fake returns a synthetic output to exercise the
+// actuator's logging.
 type fakeTurbo struct {
 	mu        sync.Mutex
-	injects   []struct{ id, freq int }
+	injects   []injectCall
 	cleans    int
 	injectOut string
 	cleanOut  string
@@ -22,12 +29,12 @@ type fakeTurbo struct {
 	cleanErr  error
 }
 
-func (f *fakeTurbo) SetFreq(ctx context.Context, cmdTemplate string, cardID, freqMHz int) (string, error) {
+func (f *fakeTurbo) SetFreq(ctx context.Context, cmdTemplate string, cardID, freqMHz, ratedMHz int) (string, error) {
 	_ = ctx
 	_ = cmdTemplate
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.injects = append(f.injects, struct{ id, freq int }{cardID, freqMHz})
+	f.injects = append(f.injects, injectCall{cardID, freqMHz, ratedMHz})
 	if f.injectErr != nil {
 		return f.injectOut, f.injectErr
 	}
@@ -52,6 +59,25 @@ func (f *fakeTurbo) injectCount() int {
 	return len(f.injects)
 }
 
+// lastInject returns the most recent recorded inject call.
+func (f *fakeTurbo) lastInject() injectCall {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if len(f.injects) == 0 {
+		return injectCall{}
+	}
+	return f.injects[len(f.injects)-1]
+}
+
+// allInjects returns a copy of all recorded inject calls.
+func (f *fakeTurbo) allInjects() []injectCall {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make([]injectCall, len(f.injects))
+	copy(out, f.injects)
+	return out
+}
+
 func (f *fakeTurbo) cleanCount() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -60,9 +86,9 @@ func (f *fakeTurbo) cleanCount() int {
 
 func TestBoostAppliesAndTracks(t *testing.T) {
 	tb := &fakeTurbo{}
-	a := NewActuator(tb, "/home/jw/npu_turbo_one.sh inject -n {id} -f {freq}", "/home/jw/npu_turbo_one.sh clean", nil)
+	a := NewActuator(tb, "/home/jw/npu_turbo_one.sh inject -d {id} -f {freq} -r {rated}", "/home/jw/npu_turbo_one.sh clean", nil)
 	ctx := context.Background()
-	if err := a.Boost(ctx, 1, 1850); err != nil {
+	if err := a.Boost(ctx, 1, 1850, 1800); err != nil {
 		t.Fatalf("Boost: %v", err)
 	}
 	if got := a.LastApplied(1); got != 1850 {
@@ -74,13 +100,16 @@ func TestBoostAppliesAndTracks(t *testing.T) {
 	if tb.injectCount() != 1 {
 		t.Errorf("expected 1 inject, got %d", tb.injectCount())
 	}
+	if got := tb.lastInject(); got != (injectCall{id: 1, freq: 1850, rated: 1800}) {
+		t.Errorf("recorded inject = %+v, want {id:1 freq:1850 rated:1800}", got)
+	}
 }
 
 func TestBoostFailureSetsOkFalseNoUpdate(t *testing.T) {
 	tb := &fakeTurbo{injectErr: errFake}
-	a := NewActuator(tb, "/home/jw/npu_turbo_one.sh inject -n {id} -f {freq}", "/home/jw/npu_turbo_one.sh clean", nil)
+	a := NewActuator(tb, "/home/jw/npu_turbo_one.sh inject -d {id} -f {freq} -r {rated}", "/home/jw/npu_turbo_one.sh clean", nil)
 	ctx := context.Background()
-	if err := a.Boost(ctx, 1, 1850); err == nil {
+	if err := a.Boost(ctx, 1, 1850, 1800); err == nil {
 		t.Fatal("expected inject error")
 	}
 	if a.Ok() {
@@ -93,10 +122,10 @@ func TestBoostFailureSetsOkFalseNoUpdate(t *testing.T) {
 
 func TestRestoreAllCleanClears(t *testing.T) {
 	tb := &fakeTurbo{}
-	a := NewActuator(tb, "/home/jw/npu_turbo_one.sh inject -n {id} -f {freq}", "/home/jw/npu_turbo_one.sh clean", nil)
+	a := NewActuator(tb, "/home/jw/npu_turbo_one.sh inject -d {id} -f {freq} -r {rated}", "/home/jw/npu_turbo_one.sh clean", nil)
 	ctx := context.Background()
-	_ = a.Boost(ctx, 1, 1850)
-	_ = a.Boost(ctx, 3, 1900)
+	_ = a.Boost(ctx, 1, 1850, 1800)
+	_ = a.Boost(ctx, 3, 1900, 1800)
 	if err := a.RestoreAll(ctx); err != nil {
 		t.Fatalf("RestoreAll: %v", err)
 	}
@@ -113,9 +142,9 @@ func TestRestoreAllCleanClears(t *testing.T) {
 
 func TestRestoreAllFailureKeepsState(t *testing.T) {
 	tb := &fakeTurbo{cleanErr: errFake}
-	a := NewActuator(tb, "/home/jw/npu_turbo_one.sh inject -n {id} -f {freq}", "/home/jw/npu_turbo_one.sh clean", nil)
+	a := NewActuator(tb, "/home/jw/npu_turbo_one.sh inject -d {id} -f {freq} -r {rated}", "/home/jw/npu_turbo_one.sh clean", nil)
 	ctx := context.Background()
-	_ = a.Boost(ctx, 1, 1850)
+	_ = a.Boost(ctx, 1, 1850, 1800)
 	if err := a.RestoreAll(ctx); err == nil {
 		t.Fatal("expected clean error")
 	}
@@ -131,10 +160,10 @@ func TestRestoreAllFailureKeepsState(t *testing.T) {
 
 func TestBoostedIDsAndLastAppliedMap(t *testing.T) {
 	tb := &fakeTurbo{}
-	a := NewActuator(tb, "/home/jw/npu_turbo_one.sh inject -n {id} -f {freq}", "/home/jw/npu_turbo_one.sh clean", nil)
+	a := NewActuator(tb, "/home/jw/npu_turbo_one.sh inject -d {id} -f {freq} -r {rated}", "/home/jw/npu_turbo_one.sh clean", nil)
 	ctx := context.Background()
-	_ = a.Boost(ctx, 1, 1850)
-	_ = a.Boost(ctx, 3, 1900)
+	_ = a.Boost(ctx, 1, 1850, 1800)
+	_ = a.Boost(ctx, 3, 1900, 1800)
 	ids := a.BoostedIDs()
 	if len(ids) != 2 || ids[0] != 1 || ids[1] != 3 {
 		t.Errorf("BoostedIDs=%v want [1 3]", ids)
@@ -147,12 +176,12 @@ func TestBoostedIDsAndLastAppliedMap(t *testing.T) {
 
 func TestAvailableChecksInjectBinary(t *testing.T) {
 	// first token "true" is on PATH → available.
-	a := NewActuator(&fakeTurbo{}, "true inject -n {id} -f {freq}", "true clean", nil)
+	a := NewActuator(&fakeTurbo{}, "true inject -d {id} -f {freq} -r {rated}", "true clean", nil)
 	if !a.Available() {
 		t.Error("Available should be true when inject binary is on PATH")
 	}
 	// first token nonexistent → not available.
-	b := NewActuator(&fakeTurbo{}, "no_such_binary_xyz inject -n {id} -f {freq}", "no_such_binary_xyz clean", nil)
+	b := NewActuator(&fakeTurbo{}, "no_such_binary_xyz inject -d {id} -f {freq} -r {rated}", "no_such_binary_xyz clean", nil)
 	if b.Available() {
 		t.Error("Available should be false when inject binary is missing")
 	}

@@ -6,15 +6,16 @@ import (
 	"testing"
 )
 
-func TestSetFreqSubstitutesIDAndFreq(t *testing.T) {
+func TestSetFreqSubstitutesAllPlaceholders(t *testing.T) {
 	var got string
 	SetMock(func(ctx context.Context, cmd string) (string, error) { got = cmd; return "inject ok\n", nil })
 	defer ResetRunner()
-	out, err := Default().SetFreq(context.Background(), "/home/jw/npu_turbo_one.sh inject -n {id} -f {freq}", 3, 1850)
+	out, err := Default().SetFreq(context.Background(),
+		"/home/jw/npu_turbo_one.sh inject -d {id} -f {freq} -r {rated}", 3, 1850, 1800)
 	if err != nil {
 		t.Fatalf("SetFreq: %v", err)
 	}
-	want := "/home/jw/npu_turbo_one.sh inject -n 3 -f 1850"
+	want := "/home/jw/npu_turbo_one.sh inject -d 3 -f 1850 -r 1800"
 	if got != want {
 		t.Errorf("cmd: got %q want %q", got, want)
 	}
@@ -23,10 +24,28 @@ func TestSetFreqSubstitutesIDAndFreq(t *testing.T) {
 	}
 }
 
+func TestSetFreqMissingPlaceholdersLeftAsIs(t *testing.T) {
+	// An old template without {rated} must keep working: absent placeholders
+	// are not substituted (no-op), so the command is unchanged.
+	var got string
+	SetMock(func(ctx context.Context, cmd string) (string, error) { got = cmd; return "", nil })
+	defer ResetRunner()
+	_, err := Default().SetFreq(context.Background(),
+		"/home/jw/npu_turbo_one.sh inject -d {id} -f {freq}", 3, 1850, 1800)
+	if err != nil {
+		t.Fatalf("SetFreq: %v", err)
+	}
+	want := "/home/jw/npu_turbo_one.sh inject -d 3 -f 1850"
+	if got != want {
+		t.Errorf("cmd: got %q want %q", got, want)
+	}
+}
+
 func TestSetFreqPropagatesErrorAndOutput(t *testing.T) {
 	SetMock(func(ctx context.Context, cmd string) (string, error) { return "boom stderr\n", errors.New("exit 2") })
 	defer ResetRunner()
-	out, err := Default().SetFreq(context.Background(), "/home/jw/npu_turbo_one.sh inject -n {id} -f {freq}", 1, 1900)
+	out, err := Default().SetFreq(context.Background(),
+		"/home/jw/npu_turbo_one.sh inject -d {id} -f {freq} -r {rated}", 1, 1900, 1800)
 	if err == nil {
 		t.Fatal("expected error, got nil")
 	}

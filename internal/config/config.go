@@ -117,18 +117,19 @@ type EnergysaveConfig struct {
 
 // NputurboConfig holds the NPU slow-card upclock actuator (nputurbo)
 // configuration (SPEC: features/nputurbo/nputurbo_SPEC.md). The slow-card
-// result is fetched via HTTP GET straggler_url (no local exec, no snapshot
-// read); the feature is off by default and starts in dry_run (judge+log)
-// mode. A is the fixed constant 1800 (not queried).
+// result is fetched via HTTP GET straggler_url (no local exec); per-card
+// current + rated frequencies are read from snapshot_npu.json (requires
+// snapshot.enabled). The feature is off by default and starts in dry_run
+// (judge+log) mode. M comes from the static rated→max map (1800→1850), not
+// from config.
 type NputurboConfig struct {
 	Enabled           bool          `yaml:"enabled"`             // default false
 	Interval          time.Duration `yaml:"interval"`            // control loop period (HTTP poll cadence)
 	StragglerURL      string        `yaml:"straggler_url"`       // HTTP GET endpoint returning the slow-card result (profiler doc)
 	StragglerTimeout  time.Duration `yaml:"straggler_timeout"`   // HTTP GET timeout
-	NpuTurboCmd       string        `yaml:"npu_turbo_cmd"`       // inject command template; {id}/{freq} replaced
+	NpuTurboCmd       string        `yaml:"npu_turbo_cmd"`       // inject command template; {id}/{freq}/{rated} replaced (absent placeholders left as-is)
 	NpuTurboCleanCmd  string        `yaml:"npu_turbo_clean_cmd"` // clean command (restores all cards); run as-is
 	NpuTurboTimeout   time.Duration `yaml:"npu_turbo_timeout"`   // npu_turbo exec timeout
-	MaxFreqMhz        int           `yaml:"max_freq_mhz"`        // M (hard cap on boost target)
 	StepMhz           int           `yaml:"step_mhz"`            // boost target quantization step
 	DryRun            bool          `yaml:"dry_run"`             // true = judge+log only, no npu_turbo exec
 	RestoreOnShutdown bool          `yaml:"restore_on_shutdown"` // restore boosted freqs on graceful shutdown
@@ -194,10 +195,9 @@ func Default() *Config {
 			Interval:          60 * time.Second,
 			StragglerURL:      "",
 			StragglerTimeout:  10 * time.Second,
-			NpuTurboCmd:       "/home/jw/npu_turbo_one.sh inject -n {id} -f {freq}",
+			NpuTurboCmd:       "/home/jw/npu_turbo_one.sh inject -d {id} -f {freq} -r {rated}",
 			NpuTurboCleanCmd:  "/home/jw/npu_turbo_one.sh clean",
 			NpuTurboTimeout:   120 * time.Second,
-			MaxFreqMhz:        1900,
 			StepMhz:           50,
 			DryRun:            true,
 			RestoreOnShutdown: true,

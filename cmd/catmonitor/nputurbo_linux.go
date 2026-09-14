@@ -26,7 +26,6 @@ func toNputurboConfig(cfg *config.Config, logger *slog.Logger) nputurbo.Config {
 		StragglerTimeout:  cfg.Nputurbo.StragglerTimeout,
 		NpuTurboCmd:       cfg.Nputurbo.NpuTurboCmd,
 		NpuTurboTimeout:   cfg.Nputurbo.NpuTurboTimeout,
-		MaxFreqMhz:        cfg.Nputurbo.MaxFreqMhz,
 		StepMhz:           cfg.Nputurbo.StepMhz,
 		DryRun:            cfg.Nputurbo.DryRun,
 		RestoreOnShutdown: cfg.Nputurbo.RestoreOnShutdown,
@@ -35,11 +34,15 @@ func toNputurboConfig(cfg *config.Config, logger *slog.Logger) nputurbo.Config {
 }
 
 // startNputurbo starts the nputurbo controller, which periodically HTTP GETs
-// straggler_url for the slow-card result, computes each slow card's target B
-// from the fixed baseline A=1800, and execs /var/npu_turbo to boost. No-op when
-// cfg.Nputurbo.Enabled is false or straggler_url is empty. nputurbo.* state
-// metrics are written to sink (the storage chain end) so they surface in
-// /metrics + snapshot_nputurbo.json + jsonl like collector-produced metrics.
+// straggler_url for the slow-device result, reads each device's current
+// (aicore_freq) + rated (aicore_rated_freq) frequencies from the daemon's
+// snapshot_npu.json, computes B = round50(min(A*score, M)) with M from the
+// static rated→max table, and execs npu_turbo_one.sh to boost. No-op when
+// cfg.Nputurbo.Enabled is false, straggler_url is empty, or snapshot
+// production is off (nputurbo consumes snapshot_npu.json — the daemon must be
+// the snapshot producer). nputurbo.* state metrics are written to sink (the
+// storage chain end) so they surface in /metrics + snapshot_nputurbo.json +
+// jsonl like collector-produced metrics.
 func startNputurbo(ctx context.Context, cfg *config.Config, sink collector.Storage, logger *slog.Logger) {
 	if !cfg.Nputurbo.Enabled {
 		return
@@ -48,8 +51,13 @@ func startNputurbo(ctx context.Context, cfg *config.Config, sink collector.Stora
 		logger.Error("nputurbo enabled but straggler_url is empty; not starting")
 		return
 	}
+	if !cfg.Snapshot.Enabled {
+		logger.Error("nputurbo enabled but snapshot.enabled is false (nputurbo reads device frequencies from snapshot_npu.json); not starting")
+		return
+	}
 	act := nputurbo.NewActuator(npu_turbo.Default(), cfg.Nputurbo.NpuTurboCmd, cfg.Nputurbo.NpuTurboCleanCmd, logger)
-	ctl := nputurbo.NewController(toNputurboConfig(cfg, logger), straggler.Default(), act, sink)
+	freqs := nputurbo.SnapshotFreqProvider{Dir: cfg.Snapshot.Dir}
+	ctl := nputurbo.NewController(toNputurboConfig(cfg, logger), straggler.Default(), act, freqs, sink)
 	nputurboCtl = ctl
 	go ctl.Run(ctx)
 }
@@ -63,10 +71,11 @@ func stopNputurbo() {
 }
 
 // runNputurboCLI is the `catmonitor nputurbo` one-shot: HTTP GET straggler_url
-// once, compute each slow card's target B from the fixed baseline A=1800, and
-// print a read-only plan. Never execs npu_turbo (forces DryRun=true).
+// once, read per-device freqs from snapshot_npu.json, and print a read-only
+// plan. Never execs npu_turbo (forces DryRun=true).
 func runNputurboCLI(cfg *config.Config, logger *slog.Logger) {
 	act := nputurbo.NewActuator(npu_turbo.Default(), cfg.Nputurbo.NpuTurboCmd, cfg.Nputurbo.NpuTurboCleanCmd, logger)
-	snap := nputurbo.RunOnce(toNputurboConfig(cfg, logger), straggler.Default(), act)
+	freqs := nputurbo.SnapshotFreqProvider{Dir: cfg.Snapshot.Dir}
+	snap := nputurbo.RunOnce(toNputurboConfig(cfg, logger), straggler.Default(), act, freqs)
 	fmt.Print(nputurbo.FormatSnapshot(snap, toNputurboConfig(cfg, logger)))
 }

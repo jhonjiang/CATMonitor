@@ -19,7 +19,7 @@ import (
 // Clean = restore all cards to baseline. Both return the command's combined
 // stdout+stderr (even on error) so the caller can log it.
 type Source interface {
-	SetFreq(ctx context.Context, cmdTemplate string, cardID, freqMHz int) (string, error)
+	SetFreq(ctx context.Context, cmdTemplate string, cardID, freqMHz, ratedMHz int) (string, error)
 	Clean(ctx context.Context, cleanCmd string) (string, error)
 }
 
@@ -54,17 +54,21 @@ func ResetRunner() {
 }
 
 // SetFreq execs the inject command (e.g.
-// "/home/jw/npu_turbo_one.sh inject -n {id} -f {freq}") with {id}/{freq}
-// substituted, to boost a single card. Returns the combined output + error.
-func (s *defaultSource) SetFreq(ctx context.Context, cmdTemplate string, cardID, freqMHz int) (string, error) {
+// "/home/jw/npu_turbo_one.sh inject -d {id} -f {freq} -r {rated}")
+// with {id}/{freq}/{rated} substituted, to boost a single card. Placeholders
+// absent from the template are left alone (backward compatible), so an old
+// "-d {id} -f {freq}" template works unchanged. Returns the combined
+// output + error.
+func (s *defaultSource) SetFreq(ctx context.Context, cmdTemplate string, cardID, freqMHz, ratedMHz int) (string, error) {
 	cmd := strings.ReplaceAll(cmdTemplate, "{id}", strconv.Itoa(cardID))
 	cmd = strings.ReplaceAll(cmd, "{freq}", strconv.Itoa(freqMHz))
+	cmd = strings.ReplaceAll(cmd, "{rated}", strconv.Itoa(ratedMHz))
 	mu.Lock()
 	r := s.runner
 	mu.Unlock()
 	out, err := r(ctx, cmd)
 	if err != nil {
-		return out, fmt.Errorf("npu_turbo SetFreq(id=%d freq=%d): %w", cardID, freqMHz, err)
+		return out, fmt.Errorf("npu_turbo SetFreq(id=%d freq=%d rated=%d): %w", cardID, freqMHz, ratedMHz, err)
 	}
 	return out, nil
 }

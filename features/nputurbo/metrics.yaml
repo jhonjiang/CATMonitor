@@ -1,8 +1,17 @@
-# nputurbo feature scope: the actuator state metrics (observability) it emits.
-# A (the boost-formula baseline) is the fixed constant fixedCurrentMHz=1800;
-# nputurbo no longer reads npu.aicore_freq from snapshot, so it does not scope
-# aicore_freq as an input.
+# nputurbo feature scope: the actuator state metrics (observability) it emits,
+# plus the NPU inputs it consumes. A (boost baseline) is each card's live
+# aicore_freq and M (boost cap) is looked up by aicore_rated_freq in the static
+# rated→max table — both are read from snapshot_npu.json, so both must be
+# collected: declared here so a features=[nputurbo] scope is self-sufficient.
+# No interval is declared (this file only scopes; cadence comes from the
+# default catalog / other feature scopes).
 components:
+  - component: npu
+    metrics:
+      - name: aicore_freq
+        priority: Medium
+      - name: aicore_rated_freq
+        priority: Medium
   - component: nputurbo
     metrics:
       - name: boost_active
