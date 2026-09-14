@@ -1,6 +1,6 @@
 //go:build !linux || !cgo
 
-package npu_dvfs
+package dvfs
 
 // stubSource is the Source used when the CGo dlopen binding is not compiled
 // in (non-Linux platforms, or CGo disabled). Every call fails with

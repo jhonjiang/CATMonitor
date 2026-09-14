@@ -10,7 +10,7 @@ import (
 	"github.com/Computing-Availability-Tools/CATMonitor/features/nputurbo"
 	"github.com/Computing-Availability-Tools/CATMonitor/internal/collector"
 	"github.com/Computing-Availability-Tools/CATMonitor/internal/config"
-	"github.com/Computing-Availability-Tools/CATMonitor/internal/source/npu_dvfs"
+	"github.com/Computing-Availability-Tools/CATMonitor/features/nputurbo/dvfs"
 	"github.com/Computing-Availability-Tools/CATMonitor/internal/source/npu_turbo"
 	"github.com/Computing-Availability-Tools/CATMonitor/internal/source/straggler"
 )
@@ -37,7 +37,7 @@ func toNputurboConfig(cfg *config.Config, logger *slog.Logger) nputurbo.Config {
 // newNputurboActuator builds the actuator over the native DVFS source and
 // the npu_turbo global-raise source.
 func newNputurboActuator(cfg *config.Config, logger *slog.Logger) *nputurbo.Actuator {
-	return nputurbo.NewActuator(npu_dvfs.Default(), npu_turbo.Default(),
+	return nputurbo.NewActuator(dvfs.Default(), npu_turbo.Default(),
 		cfg.Nputurbo.NpuTurboBin, cfg.Nputurbo.NpuTurboTimeout, logger)
 }
 

@@ -10,7 +10,7 @@
 // B = round50(min(A*score, M)) for every listed device with score > 1.
 //
 // The control loop is stateless: every cycle restores ALL devices to their
-// own rated frequency (native DSMI via internal/source/npu_dvfs, the former
+// own rated frequency (native DSMI via features/nputurbo/dvfs, the former
 // dvfs.py semantics — no python or scripts on the node), then re-applies the
 // boost set from the fresh list: above-rated targets in one batch (global
 // raise via the external npu_turbo binary, then lower every non-target to

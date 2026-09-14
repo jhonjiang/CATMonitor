@@ -12,17 +12,17 @@ import (
 	"sync"
 	"time"
 
-	"github.com/Computing-Availability-Tools/CATMonitor/internal/source/npu_dvfs"
+	"github.com/Computing-Availability-Tools/CATMonitor/features/nputurbo/dvfs"
 	"github.com/Computing-Availability-Tools/CATMonitor/internal/source/npu_turbo"
 )
 
 // Actuator drives NPU frequencies natively: per-device DVFS via the DSMI
-// host library (npu_dvfs, the former dvfs.py semantics) and the global
+// host library (dvfs, the former dvfs.py semantics) and the global
 // above-rated raise via the external npu_turbo binary. It is stateless —
 // the controller resets and re-applies the boost set every tick, so no
 // per-device bookkeeping (lastApplied) exists.
 type Actuator struct {
-	dvfs    npu_dvfs.Source  // native per-device DVFS (clean / at-or-below-rated pins)
+	dvfs    dvfs.Source  // native per-device DVFS (clean / at-or-below-rated pins)
 	raise   npu_turbo.Source // global above-rated raise (exec seam; tests inject a fake)
 	bin     string           // npu_turbo binary path (config npu_turbo_bin)
 	timeout time.Duration    // npu_turbo exec timeout
@@ -34,7 +34,7 @@ type Actuator struct {
 
 // NewActuator builds an Actuator over the given DVFS source and global-raise
 // source. bin is the npu_turbo binary path; timeout bounds its exec.
-func NewActuator(dvfs npu_dvfs.Source, raise npu_turbo.Source, bin string, timeout time.Duration, logger *slog.Logger) *Actuator {
+func NewActuator(dvfs dvfs.Source, raise npu_turbo.Source, bin string, timeout time.Duration, logger *slog.Logger) *Actuator {
 	return &Actuator{
 		dvfs:    dvfs,
 		raise:   raise,

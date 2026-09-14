@@ -17,13 +17,15 @@
 > **修订(2026-09-14):** ① **device 对齐修复**:straggler 清单里的 id 确认为**全局 device id**(`npu_id × chips_per_card + chip_id`,即 stragglerout 喂给检测器的编号);`SnapshotFreqProvider` 改为按同一公式对齐(原按 `npu_id` 卡槽号对齐,双芯片节点会查不到/查错;单芯片两者重合,行为不变)。A3 双芯片不再"取 min"——每个 chip 是独立 device 条目。② **日志/CLI 人话化**:消息改为完整英文句子、面向运维(去掉 would_boost/desired/idempotent 等内部术语),全特性统一用 device 用语(与 `inject -d` 一致);`catmonitor nputurbo` 预览输出同步重写。
 >
 > **修订(2026-09-14 二次)——原生集成与无状态模型:** 基于外部 `npu_turbo_one.sh` + `dvfs.py` 源码分析,执行层重构:
-> ① **原生集成**——dvfs.py 的 DSMI 调用（关/开 idle、设频、查额定、枚举设备）由 `internal/source/npu_dvfs` 以 CGo+dlopen 原生实现（节点不再需要 python/脚本;非 NPU 节点优雅降级）;脚本编排逻辑进 controller/actuator;`npu_turbo_cmd`/`npu_turbo_clean_cmd` 配置删除,新增 `npu_turbo_bin`（全局抬频二进制路径,唯一残留 exec,默认 `/home/jw/npu_turbo`）。
+> ① **原生集成**——dvfs.py 的 DSMI 调用（关/开 idle、设频、查额定、枚举设备）以 CGo+dlopen 原生实现（节点不再需要 python/脚本;非 NPU 节点优雅降级）;脚本编排逻辑进 controller/actuator;`npu_turbo_cmd`/`npu_turbo_clean_cmd` 配置删除,新增 `npu_turbo_bin`（全局抬频二进制路径,唯一残留 exec,默认 `/home/jw/npu_turbo`）。
 > ② **无状态每轮重置**——删除 LastApplied/reconcile 全部状态;每轮有效 plan 后先 `CleanAll`（逐设备恢复到**各自**额定+重开 idle,修掉原脚本用 device 0 额定统一恢复的缺陷,混布额定节点也正确）,再按新清单注入。
 > ③ **注入顺序**——先**一起**调 B>额定 组（一次 `npu_turbo -f maxB` 全局抬频 + 逐个非目标降到各自额定）,再逐张调 B≤额定 组（原生钉频）;顺序不可换——批量降额会覆盖先做的钉频。
+>
+> **修订(2026-09-14 三次):** `npu_dvfs` 来源包由 `internal/source/` 移至 **`features/nputurbo/dvfs`**(包名缩短为 `dvfs`)——确认知其仅被 nputurbo 使用,特性内聚优先;`internal/source/` 保留通用来源层(npu_turbo 全局抬频仍在其中)。
 
 ## 1. 目标
 
-对慢卡(跑同一任务比正常卡慢,`score > 1.0`)升频。慢卡清单由**外部 straggler 检测器**产出:daemon 周期 HTTP GET `straggler_url` 拿检测结果(profiler doc);nputurbo 结合 `snapshot_npu.json` 里的实时/额定频率对每张慢卡算目标频率 B,然后**每轮先恢复所有设备到各自额定,再按新清单注入**——B>额定 的组一次批量全局抬频,B≤额定 的组逐张原生钉频。执行层为原生 DSMI 调用(`internal/source/npu_dvfs`,原 dvfs.py 语义)+ 唯一外部依赖 `npu_turbo` 二进制(全局抬频)。
+对慢卡(跑同一任务比正常卡慢,`score > 1.0`)升频。慢卡清单由**外部 straggler 检测器**产出:daemon 周期 HTTP GET `straggler_url` 拿检测结果(profiler doc);nputurbo 结合 `snapshot_npu.json` 里的实时/额定频率对每张慢卡算目标频率 B,然后**每轮先恢复所有设备到各自额定,再按新清单注入**——B>额定 的组一次批量全局抬频,B≤额定 的组逐张原生钉频。执行层为原生 DSMI 调用(`features/nputurbo/dvfs`,原 dvfs.py 语义)+ 唯一外部依赖 `npu_turbo` 二进制(全局抬频)。
 
 ## 2. 架构
 
@@ -41,7 +43,7 @@ Controller.tick (interval):
    emitMetrics → sink(/metrics + snapshot_nputurbo.json + jsonl)
 ```
 
-依赖:`internal/source/straggler`(HTTP GET fetch)、`internal/source/npu_dvfs`(CGo+dlopen 绑定 `libdrvdsmi_host.so`,原生 DVFS)、`internal/source/npu_turbo`(exec `npu_turbo -f <MHz>` 全局抬频)、`features/snapshot`(只读 `snapshot_npu.json`)、`internal/metrics`(Filter)。A/M 来自 daemon 产出的快照——**启用前置:`snapshot.enabled: true`**(daemon 是唯一 snapshot 生产者;`startNputurbo` 校验,不满足不启动)。另需节点上有 Ascend driver(`libdrvdsmi_host.so`)与 `npu_turbo` 二进制(路径 `npu_turbo_bin`,仅 B>额定 时需要)。
+依赖:`internal/source/straggler`(HTTP GET fetch)、`features/nputurbo/dvfs`(CGo+dlopen 绑定 `libdrvdsmi_host.so`,原生 DVFS)、`internal/source/npu_turbo`(exec `npu_turbo -f <MHz>` 全局抬频)、`features/snapshot`(只读 `snapshot_npu.json`)、`internal/metrics`(Filter)。A/M 来自 daemon 产出的快照——**启用前置:`snapshot.enabled: true`**(daemon 是唯一 snapshot 生产者;`startNputurbo` 校验,不满足不启动)。另需节点上有 Ascend driver(`libdrvdsmi_host.so`)与 `npu_turbo` 二进制(路径 `npu_turbo_bin`,仅 B>额定 时需要)。
 
 ## 3. 输入获取(straggler,HTTP)
 
@@ -78,7 +80,7 @@ straggler 写法可能是"一行整份 profiler doc"或"整文件一整份 JSON(
 
 ## 6. 执行器(actuator,原生集成)
 
-actuator 持有两个执行源:**原生 DVFS**(`internal/source/npu_dvfs`,CGo+dlopen `libdrvdsmi_host.so`,原 dvfs.py 语义)与**全局抬频**(`internal/source/npu_turbo`,exec `npu_turbo -f <MHz>`)。三个操作:
+actuator 持有两个执行源:**原生 DVFS**(`features/nputurbo/dvfs`,CGo+dlopen `libdrvdsmi_host.so`,原 dvfs.py 语义)与**全局抬频**(`internal/source/npu_turbo`,exec `npu_turbo -f <MHz>`)。三个操作:
 
 - **`CleanAll()`**(原生):逐设备 关idle → 设**该设备自己的**额定(原脚本用 device 0 额定统一恢复,已修)→ 开idle。单设备失败记 warn 继续,不中断其余设备。
 - **`BoostAbove(ctx, targetIDs, freq)`**(全局抬频 + 降其余):① exec `npu_turbo -f freq` 全局抬频(失败即中止,不降其余);② 枚举全部设备,非目标逐个 关idle→设各自额定→开idle(单点失败 warn 继续)。目标设备由抬频工具负责,actuator 不再触碰。
@@ -146,7 +148,7 @@ CATMonitor nputurbo (read-only preview — no frequencies are changed)
 ## 11. 测试
 
 - `internal/source/straggler/`:fetcher seam 注入假响应,验证 fetch 超时/错误传播。
-- `internal/source/npu_dvfs/`:只读冒烟(Available/DeviceIDs/RatedFreq,skip 守卫);**测试绝不调用写操作**(SetAicFreq/CloseIdle/OpenIdle 会动真机硬件)。
+- `features/nputurbo/dvfs/`:只读冒烟(Available/DeviceIDs/RatedFreq,skip 守卫);**测试绝不调用写操作**(SetAicFreq/CloseIdle/OpenIdle 会动真机硬件)。
 - `internal/source/npu_turbo/`:RaiseAll 参数拼接(`<bin> -f <MHz>`)、错误与输出透传。
 - `features/nputurbo/input_test.go`:jsonl fixture 覆盖——单行整 doc、pretty-print 整 doc、多行追加(取末行)、`node_result` 空、多 node 多卡、坏行跳过、全坏返回 error。
 - `features/nputurbo/freq_test.go`:映射表查找(1800→1850 命中/未映射 miss)、`SnapshotFreqProvider` 从 snapshot fixture 提取(单芯片 device id==npu_id / A3 双芯片全局 id `npu×2+chip` 每 chip 独立条目 / 缺 rated / 缺 chip_id 回退 npu_id / 缺文件空 map)。

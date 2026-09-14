@@ -1,4 +1,4 @@
-// Package npu_dvfs provides native DVFS control over Ascend NPUs via the
+// Package dvfs provides native DVFS control over Ascend NPUs via the
 // driver's DSMI host library (libdrvdsmi_host.so), loaded at runtime with
 // dlopen. It reimplements the semantics of the former external dvfs.py tool:
 //
@@ -19,19 +19,19 @@
 // dual-chip cards the slave die (odd device id) cannot run above the master
 // die (even device id) of the same card.
 //
-// The CGo dlopen binding lives in npu_dvfs_linux.go behind `linux && cgo`,
+// The CGo dlopen binding lives in dvfs_linux.go behind `linux && cgo`,
 // so default builds (and non-Linux cross-compiles) get the not-available stub
-// in npu_dvfs_stub.go and degrade gracefully. dlopen means build machines do
+// in dvfs_stub.go and degrade gracefully. dlopen means build machines do
 // NOT need the Ascend driver installed; the library is resolved at runtime on
 // the NPU host. Tests must never call the mutating operations (SetAicFreq /
 // CloseIdle / OpenIdle) — they touch real hardware.
-package npu_dvfs
+package dvfs
 
 import "errors"
 
 // errNotAvailable is returned when no DSMI library could be loaded (no CGo
 // build, or the Ascend driver library is absent on this host).
-var errNotAvailable = errors.New("npu_dvfs: not available (libdrvdsmi_host.so not loaded — is this an Ascend NPU host?)")
+var errNotAvailable = errors.New("dvfs: not available (libdrvdsmi_host.so not loaded — is this an Ascend NPU host?)")
 
 // Source is the native DVFS control surface consumed by the nputurbo
 // actuator. All methods are synchronous in-process DSMI calls.

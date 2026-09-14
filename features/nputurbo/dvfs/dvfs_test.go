@@ -1,4 +1,4 @@
-package npu_dvfs
+package dvfs
 
 import "testing"
 

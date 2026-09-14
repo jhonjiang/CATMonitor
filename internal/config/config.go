@@ -119,7 +119,7 @@ type EnergysaveConfig struct {
 // configuration (SPEC: features/nputurbo/nputurbo_SPEC.md). The slow-card
 // result is fetched via HTTP GET straggler_url; per-device current + rated
 // frequencies are read from snapshot_npu.json (requires snapshot.enabled).
-// Frequency control is native (DSMI via internal/source/npu_dvfs, the former
+// Frequency control is native (DSMI via features/nputurbo/dvfs, the former
 // dvfs.py semantics); only the above-rated global raise execs the external
 // npu_turbo binary at npu_turbo_bin. The feature is off by default and
 // starts in dry_run (judge+log) mode. M comes from the static rated→max map

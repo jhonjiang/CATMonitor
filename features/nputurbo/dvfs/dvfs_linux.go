@@ -1,6 +1,6 @@
 //go:build linux && cgo
 
-package npu_dvfs
+package dvfs
 
 /*
 #cgo LDFLAGS: -ldl
@@ -86,7 +86,7 @@ func callSym(sym string, fn func(cs *C.char) C.int) error {
 	cs := C.CString(sym)
 	defer C.free(unsafe.Pointer(cs))
 	if ret := fn(cs); ret != 0 {
-		return fmt.Errorf("npu_dvfs: %s returned %d", sym, int(ret))
+		return fmt.Errorf("dvfs: %s returned %d", sym, int(ret))
 	}
 	return nil
 }
@@ -101,7 +101,7 @@ func (dlopenSource) DeviceIDs() ([]int, error) {
 		return nil, err
 	}
 	if count <= 0 {
-		return nil, fmt.Errorf("npu_dvfs: dsmi_get_device_count returned %d devices", int(count))
+		return nil, fmt.Errorf("dvfs: dsmi_get_device_count returned %d devices", int(count))
 	}
 	ids := make([]C.int, count)
 	if err := callSym("dsmi_list_device", func(cs *C.char) C.int {

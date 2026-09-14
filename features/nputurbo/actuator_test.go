@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/Computing-Availability-Tools/CATMonitor/internal/source/npu_dvfs"
+	"github.com/Computing-Availability-Tools/CATMonitor/features/nputurbo/dvfs"
 )
 
 // dvfsCall records one mutating call against a device.
@@ -19,7 +19,7 @@ type dvfsCall struct {
 	freq int // set_freq only
 }
 
-// fakeDVFS implements npu_dvfs.Source; it records the call sequence and
+// fakeDVFS implements dvfs.Source; it records the call sequence and
 // serves a configurable device list, per-device rated freqs, and optional
 // per-device failures.
 type fakeDVFS struct {
@@ -123,7 +123,7 @@ var (
 	errRAISE = errors.New("npu_turbo exit 1")
 )
 
-func newTestActuator(dvfs npu_dvfs.Source, raise *fakeRaiser) *Actuator {
+func newTestActuator(dvfs dvfs.Source, raise *fakeRaiser) *Actuator {
 	return NewActuator(dvfs, raise, "/home/jw/npu_turbo", 5*time.Second, nil)
 }
 
