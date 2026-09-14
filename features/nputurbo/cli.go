@@ -31,7 +31,8 @@ type Snapshot struct {
 	Rows       []BoostRow
 	Skipped    []SkipRow
 	DryRun     bool
-	ActuatorOK bool
+	ActuatorOK bool // native DVFS library available
+	TurboOK    bool // npu_turbo binary found (above-rated boost available)
 	PlanErr    error
 }
 
@@ -43,7 +44,14 @@ func RunOnce(cfg Config, stragg StragglerSource, actuator *Actuator, freqs FreqP
 	cfg.DryRun = true
 	c := NewController(cfg, stragg, actuator, freqs, nil)
 	p, err := c.planBoosts()
-	return Snapshot{Rows: p.rows, Skipped: p.skipped, DryRun: true, ActuatorOK: actuator.Available(), PlanErr: err}
+	return Snapshot{
+		Rows:       p.rows,
+		Skipped:    p.skipped,
+		DryRun:     true,
+		ActuatorOK: actuator.Available(),
+		TurboOK:    actuator.TurboAvailable(),
+		PlanErr:    err,
+	}
 }
 
 // FormatSnapshot renders the plan as the human-readable `catmonitor nputurbo`
@@ -52,6 +60,7 @@ func FormatSnapshot(s Snapshot, cfg Config) string {
 	var b strings.Builder
 	fmt.Fprintln(&b, "CATMonitor nputurbo (read-only preview — no frequencies are changed)")
 	fmt.Fprintf(&b, "  actuator available: %v\n", s.ActuatorOK)
+	fmt.Fprintf(&b, "  npu_turbo binary:   %v\n", s.TurboOK)
 	fmt.Fprintf(&b, "  boost caps:         %s  (step %d MHz)\n", formatRatedMaxBoost(), cfg.StepMhz)
 	if s.PlanErr != nil {
 		fmt.Fprintf(&b, "  plan error:         %v\n", s.PlanErr)

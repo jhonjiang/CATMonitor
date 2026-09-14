@@ -4,196 +4,289 @@ package nputurbo
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"testing"
+	"time"
+
+	"github.com/Computing-Availability-Tools/CATMonitor/internal/source/npu_dvfs"
 )
 
-// injectCall is one recorded inject: the card id, target freq, and rated
-// freq as passed to the source's SetFreq.
-type injectCall struct {
-	id, freq, rated int
+// dvfsCall records one mutating call against a device.
+type dvfsCall struct {
+	op   string // "close_idle" | "open_idle" | "set_freq"
+	id   int
+	freq int // set_freq only
 }
 
-// fakeTurbo implements npu_turbo.Source; it records inject calls and a clean
-// count, and returns a configurable output string. The real source
-// substitutes {id}/{freq}/{rated} internally and returns combined
-// stdout+stderr, so the fake returns a synthetic output to exercise the
-// actuator's logging.
-type fakeTurbo struct {
-	mu        sync.Mutex
-	injects   []injectCall
-	cleans    int
-	injectOut string
-	cleanOut  string
-	injectErr error
-	cleanErr  error
+// fakeDVFS implements npu_dvfs.Source; it records the call sequence and
+// serves a configurable device list, per-device rated freqs, and optional
+// per-device failures.
+type fakeDVFS struct {
+	mu      sync.Mutex
+	ids     []int
+	rated   map[int]int              // device -> rated MHz (default 1800)
+	failSet map[int]error            // device -> SetAicFreq failure
+	calls   []dvfsCall
 }
 
-func (f *fakeTurbo) SetFreq(ctx context.Context, cmdTemplate string, cardID, freqMHz, ratedMHz int) (string, error) {
-	_ = ctx
-	_ = cmdTemplate
+func newFakeDVFS(ids ...int) *fakeDVFS {
+	return &fakeDVFS{ids: ids, rated: map[int]int{}}
+}
+
+func (f *fakeDVFS) Available() bool { return true }
+
+func (f *fakeDVFS) DeviceIDs() ([]int, error) {
+	return append([]int(nil), f.ids...), nil
+}
+
+func (f *fakeDVFS) RatedFreq(devID int) (int, error) {
+	if r, ok := f.rated[devID]; ok {
+		return r, nil
+	}
+	return 1800, nil
+}
+
+func (f *fakeDVFS) CloseIdle(devID int) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.injects = append(f.injects, injectCall{cardID, freqMHz, ratedMHz})
-	if f.injectErr != nil {
-		return f.injectOut, f.injectErr
-	}
-	return f.injectOut, nil
+	f.calls = append(f.calls, dvfsCall{op: "close_idle", id: devID})
+	return nil
 }
 
-func (f *fakeTurbo) Clean(ctx context.Context, cleanCmd string) (string, error) {
-	_ = ctx
-	_ = cleanCmd
+func (f *fakeDVFS) OpenIdle(devID int) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.cleans++
-	if f.cleanErr != nil {
-		return f.cleanOut, f.cleanErr
-	}
-	return f.cleanOut, nil
+	f.calls = append(f.calls, dvfsCall{op: "open_idle", id: devID})
+	return nil
 }
 
-func (f *fakeTurbo) injectCount() int {
+func (f *fakeDVFS) SetAicFreq(devID int, freqMHz int) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	return len(f.injects)
+	f.calls = append(f.calls, dvfsCall{op: "set_freq", id: devID, freq: freqMHz})
+	if err, ok := f.failSet[devID]; ok {
+		return err
+	}
+	return nil
 }
 
-// lastInject returns the most recent recorded inject call.
-func (f *fakeTurbo) lastInject() injectCall {
+func (f *fakeDVFS) recorded() []dvfsCall {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if len(f.injects) == 0 {
-		return injectCall{}
-	}
-	return f.injects[len(f.injects)-1]
+	return append([]dvfsCall(nil), f.calls...)
 }
 
-// allInjects returns a copy of all recorded inject calls.
-func (f *fakeTurbo) allInjects() []injectCall {
+// opsFor returns the recorded ops for one device in order.
+func (f *fakeDVFS) opsFor(id int) []string {
+	var ops []string
+	for _, c := range f.recorded() {
+		if c.id == id {
+			ops = append(ops, c.op)
+		}
+	}
+	return ops
+}
+
+// fakeRaiser implements npu_turbo.Source; it records global raises.
+type fakeRaiser struct {
+	mu     sync.Mutex
+	raises []struct {
+		bin  string
+		freq int
+	}
+	out string
+	err error
+}
+
+func (f *fakeRaiser) RaiseAll(ctx context.Context, bin string, freqMHz int) (string, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	out := make([]injectCall, len(f.injects))
-	copy(out, f.injects)
-	return out
+	f.raises = append(f.raises, struct {
+		bin  string
+		freq int
+	}{bin, freqMHz})
+	if f.err != nil {
+		return f.out, f.err
+	}
+	return f.out, nil
 }
 
-func (f *fakeTurbo) cleanCount() int {
+func (f *fakeRaiser) raiseCount() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	return f.cleans
+	return len(f.raises)
 }
 
-func TestBoostAppliesAndTracks(t *testing.T) {
-	tb := &fakeTurbo{}
-	a := NewActuator(tb, "/home/jw/npu_turbo_one.sh inject -d {id} -f {freq} -r {rated}", "/home/jw/npu_turbo_one.sh clean", nil)
-	ctx := context.Background()
-	if err := a.Boost(ctx, 1, 1850, 1800); err != nil {
-		t.Fatalf("Boost: %v", err)
-	}
-	if got := a.LastApplied(1); got != 1850 {
-		t.Errorf("LastApplied(1)=%d want 1850", got)
-	}
-	if !a.Ok() {
-		t.Error("Ok should be true after successful boost")
-	}
-	if tb.injectCount() != 1 {
-		t.Errorf("expected 1 inject, got %d", tb.injectCount())
-	}
-	if got := tb.lastInject(); got != (injectCall{id: 1, freq: 1850, rated: 1800}) {
-		t.Errorf("recorded inject = %+v, want {id:1 freq:1850 rated:1800}", got)
-	}
+var (
+	errDVFS = errors.New("dsmi set failed")
+	errRAISE = errors.New("npu_turbo exit 1")
+)
+
+func newTestActuator(dvfs npu_dvfs.Source, raise *fakeRaiser) *Actuator {
+	return NewActuator(dvfs, raise, "/home/jw/npu_turbo", 5*time.Second, nil)
 }
 
-func TestBoostFailureSetsOkFalseNoUpdate(t *testing.T) {
-	tb := &fakeTurbo{injectErr: errFake}
-	a := NewActuator(tb, "/home/jw/npu_turbo_one.sh inject -d {id} -f {freq} -r {rated}", "/home/jw/npu_turbo_one.sh clean", nil)
-	ctx := context.Background()
-	if err := a.Boost(ctx, 1, 1850, 1800); err == nil {
-		t.Fatal("expected inject error")
+func TestCleanAllRestoresEachDeviceToItsOwnRated(t *testing.T) {
+	dvfs := newFakeDVFS(0, 1, 2)
+	dvfs.rated[2] = 2000 // mixed ratings: device 2 rated 2000
+	act := newTestActuator(dvfs, &fakeRaiser{})
+	if err := act.CleanAll(); err != nil {
+		t.Fatalf("CleanAll: %v", err)
 	}
-	if a.Ok() {
-		t.Error("Ok should be false after failed boost")
+	for _, id := range []int{0, 1} {
+		if got := dvfs.opsFor(id); !equal(got, []string{"close_idle", "set_freq", "open_idle"}) {
+			t.Errorf("device %d ops = %v, want close/set/open", id, got)
+		}
 	}
-	if got := a.LastApplied(1); got != 0 {
-		t.Errorf("LastApplied(1) should stay 0 on failure, got %d", got)
+	if got := dvfs.opsFor(2); !equal(got, []string{"close_idle", "set_freq", "open_idle"}) {
+		t.Errorf("device 2 ops = %v", got)
 	}
-}
-
-func TestRestoreAllCleanClears(t *testing.T) {
-	tb := &fakeTurbo{}
-	a := NewActuator(tb, "/home/jw/npu_turbo_one.sh inject -d {id} -f {freq} -r {rated}", "/home/jw/npu_turbo_one.sh clean", nil)
-	ctx := context.Background()
-	_ = a.Boost(ctx, 1, 1850, 1800)
-	_ = a.Boost(ctx, 3, 1900, 1800)
-	if err := a.RestoreAll(ctx); err != nil {
-		t.Fatalf("RestoreAll: %v", err)
+	for _, c := range dvfs.recorded() {
+		if c.op != "set_freq" {
+			continue
+		}
+		want := 1800
+		if c.id == 2 {
+			want = 2000 // per-device rated, not a single global value
+		}
+		if c.freq != want {
+			t.Errorf("device %d set to %d MHz, want %d", c.id, c.freq, want)
+		}
 	}
-	if tb.cleanCount() != 1 {
-		t.Errorf("expected 1 clean, got %d", tb.cleanCount())
-	}
-	if a.LastApplied(1) != 0 || a.LastApplied(3) != 0 {
-		t.Errorf("lastApplied should be cleared, got 1:%d 3:%d", a.LastApplied(1), a.LastApplied(3))
-	}
-	if len(a.BoostedIDs()) != 0 {
-		t.Errorf("BoostedIDs should be empty after clean, got %v", a.BoostedIDs())
+	if !act.Ok() {
+		t.Error("Ok should be true after successful clean")
 	}
 }
 
-func TestRestoreAllFailureKeepsState(t *testing.T) {
-	tb := &fakeTurbo{cleanErr: errFake}
-	a := NewActuator(tb, "/home/jw/npu_turbo_one.sh inject -d {id} -f {freq} -r {rated}", "/home/jw/npu_turbo_one.sh clean", nil)
-	ctx := context.Background()
-	_ = a.Boost(ctx, 1, 1850, 1800)
-	if err := a.RestoreAll(ctx); err == nil {
-		t.Fatal("expected clean error")
+func TestCleanAllPerDeviceFailureIsolated(t *testing.T) {
+	dvfs := newFakeDVFS(0, 1, 2)
+	dvfs.failSet = map[int]error{1: errDVFS}
+	act := newTestActuator(dvfs, &fakeRaiser{})
+	err := act.CleanAll()
+	if err == nil {
+		t.Fatal("expected error when one device fails")
 	}
-	if a.Ok() {
-		t.Error("Ok should be false after failed clean")
+	if act.Ok() {
+		t.Error("Ok should be false after partial clean failure")
 	}
-	// On clean failure the boosted state is kept (we can't know what the
-	// tool actually did, but we don't silently claim it's clean).
-	if a.LastApplied(1) != 1850 {
-		t.Errorf("LastApplied(1) should stay 1850 on clean failure, got %d", a.LastApplied(1))
-	}
-}
-
-func TestBoostedIDsAndLastAppliedMap(t *testing.T) {
-	tb := &fakeTurbo{}
-	a := NewActuator(tb, "/home/jw/npu_turbo_one.sh inject -d {id} -f {freq} -r {rated}", "/home/jw/npu_turbo_one.sh clean", nil)
-	ctx := context.Background()
-	_ = a.Boost(ctx, 1, 1850, 1800)
-	_ = a.Boost(ctx, 3, 1900, 1800)
-	ids := a.BoostedIDs()
-	if len(ids) != 2 || ids[0] != 1 || ids[1] != 3 {
-		t.Errorf("BoostedIDs=%v want [1 3]", ids)
-	}
-	m := a.LastAppliedMap()
-	if m[1] != 1850 || m[3] != 1900 || len(m) != 2 {
-		t.Errorf("LastAppliedMap=%v want {1:1850 3:1900}", m)
+	// Devices 0 and 2 must still be fully restored.
+	for _, id := range []int{0, 2} {
+		if got := dvfs.opsFor(id); !equal(got, []string{"close_idle", "set_freq", "open_idle"}) {
+			t.Errorf("device %d ops = %v, want close/set/open (failure must not abort the loop)", id, got)
+		}
 	}
 }
 
-func TestAvailableChecksInjectBinary(t *testing.T) {
-	// first token "true" is on PATH → available.
-	a := NewActuator(&fakeTurbo{}, "true inject -d {id} -f {freq} -r {rated}", "true clean", nil)
-	if !a.Available() {
-		t.Error("Available should be true when inject binary is on PATH")
+func TestBoostAboveRaisesThenLowersNonTargets(t *testing.T) {
+	dvfs := newFakeDVFS(0, 1, 2, 3, 4, 5)
+	dvfs.rated[4] = 2000
+	raise := &fakeRaiser{}
+	act := newTestActuator(dvfs, raise)
+	if err := act.BoostAbove(context.Background(), []int{1, 3}, 1850); err != nil {
+		t.Fatalf("BoostAbove: %v", err)
 	}
-	// first token nonexistent → not available.
-	b := NewActuator(&fakeTurbo{}, "no_such_binary_xyz inject -d {id} -f {freq} -r {rated}", "no_such_binary_xyz clean", nil)
-	if b.Available() {
-		t.Error("Available should be false when inject binary is missing")
+	// One global raise with the configured bin and frequency.
+	if raise.raiseCount() != 1 {
+		t.Fatalf("expected exactly 1 global raise, got %d", raise.raiseCount())
 	}
-	// empty inject cmd → not available.
-	c := NewActuator(&fakeTurbo{}, "", "x", nil)
-	if c.Available() {
-		t.Error("Available should be false for empty inject cmd")
+	if raise.raises[0].bin != "/home/jw/npu_turbo" || raise.raises[0].freq != 1850 {
+		t.Errorf("raise = (bin=%s freq=%d), want (/home/jw/npu_turbo, 1850)", raise.raises[0].bin, raise.raises[0].freq)
+	}
+	// Targets are NOT touched by dvfs (the raise tool owns them).
+	for _, id := range []int{1, 3} {
+		if ops := dvfs.opsFor(id); len(ops) != 0 {
+			t.Errorf("target device %d should not be touched by dvfs, got %v", id, ops)
+		}
+	}
+	// Non-targets are lowered to their OWN rated with idle re-enabled.
+	for _, id := range []int{0, 2, 5} {
+		if got := dvfs.opsFor(id); !equal(got, []string{"close_idle", "set_freq", "open_idle"}) {
+			t.Errorf("non-target device %d ops = %v", id, got)
+		}
+	}
+	if got := dvfs.opsFor(4); !equal(got, []string{"close_idle", "set_freq", "open_idle"}) {
+		t.Errorf("non-target device 4 ops = %v", got)
+	}
+	for _, c := range dvfs.recorded() {
+		if c.op == "set_freq" && c.id == 4 && c.freq != 2000 {
+			t.Errorf("device 4 lowered to %d, want its own rated 2000", c.freq)
+		}
+	}
+	if !act.Ok() {
+		t.Error("Ok should be true after success")
 	}
 }
 
-var errFake = fakeErr("inject failed")
+func TestBoostAboveRaiseFailureAbortsBeforeLowering(t *testing.T) {
+	dvfs := newFakeDVFS(0, 1, 2)
+	raise := &fakeRaiser{err: errRAISE}
+	act := newTestActuator(dvfs, raise)
+	if err := act.BoostAbove(context.Background(), []int{1}, 1850); err == nil {
+		t.Fatal("expected raise error to propagate")
+	}
+	if act.Ok() {
+		t.Error("Ok should be false after failed raise")
+	}
+	if got := len(dvfs.recorded()); got != 0 {
+		t.Errorf("no lowering must happen after a failed raise, got %d dvfs calls", got)
+	}
+}
 
-type fakeErr string
+func TestBoostAtOrBelowPinsWithoutReopeningIdle(t *testing.T) {
+	dvfs := newFakeDVFS(0, 1)
+	act := newTestActuator(dvfs, &fakeRaiser{})
+	if err := act.BoostAtOrBelow(1, 1150); err != nil {
+		t.Fatalf("BoostAtOrBelow: %v", err)
+	}
+	// Case-1 semantics: close idle + set freq, idle stays closed (pinned).
+	if got := dvfs.opsFor(1); !equal(got, []string{"close_idle", "set_freq"}) {
+		t.Errorf("device 1 ops = %v, want [close_idle set_freq] (no open_idle)", got)
+	}
+	for _, c := range dvfs.recorded() {
+		if c.id == 1 && c.op == "set_freq" && c.freq != 1150 {
+			t.Errorf("device 1 pinned at %d, want 1150", c.freq)
+		}
+	}
+	if !act.Ok() {
+		t.Error("Ok should be true after success")
+	}
+}
 
-func (e fakeErr) Error() string { return string(e) }
+func TestBoostAtOrBelowFailureSetsOkFalse(t *testing.T) {
+	dvfs := newFakeDVFS(0, 1)
+	dvfs.failSet = map[int]error{1: errDVFS}
+	act := newTestActuator(dvfs, &fakeRaiser{})
+	if err := act.BoostAtOrBelow(1, 1150); err == nil {
+		t.Fatal("expected pin error")
+	}
+	if act.Ok() {
+		t.Error("Ok should be false after failed pin")
+	}
+}
+
+func TestAvailableAndTurboAvailable(t *testing.T) {
+	dvfs := newFakeDVFS(0)
+	// dvfs available + turbo bin on PATH ("true") → both true.
+	act := NewActuator(dvfs, &fakeRaiser{}, "true", time.Second, nil)
+	if !act.Available() || !act.TurboAvailable() {
+		t.Errorf("Available=%v TurboAvailable=%v, want both true", act.Available(), act.TurboAvailable())
+	}
+	// Missing turbo bin → turbo unavailable, dvfs still available.
+	act2 := NewActuator(dvfs, &fakeRaiser{}, "/no/such/npu_turbo_bin", time.Second, nil)
+	if !act2.Available() || act2.TurboAvailable() {
+		t.Errorf("Available=%v TurboAvailable=%v, want true/false", act2.Available(), act2.TurboAvailable())
+	}
+}
+
+func equal(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}

@@ -3,83 +3,48 @@ package npu_turbo
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 )
 
-func TestSetFreqSubstitutesAllPlaceholders(t *testing.T) {
-	var got string
-	SetMock(func(ctx context.Context, cmd string) (string, error) { got = cmd; return "inject ok\n", nil })
+func TestRaiseAllBuildsCommand(t *testing.T) {
+	var gotName string
+	var gotArgs []string
+	SetMock(func(ctx context.Context, name string, args ...string) (string, error) {
+		gotName = name
+		gotArgs = args
+		return "raise ok\n", nil
+	})
 	defer ResetRunner()
-	out, err := Default().SetFreq(context.Background(),
-		"/home/jw/npu_turbo_one.sh inject -d {id} -f {freq} -r {rated}", 3, 1850, 1800)
+	out, err := Default().RaiseAll(context.Background(), "/home/jw/npu_turbo", 1850)
 	if err != nil {
-		t.Fatalf("SetFreq: %v", err)
+		t.Fatalf("RaiseAll: %v", err)
 	}
-	want := "/home/jw/npu_turbo_one.sh inject -d 3 -f 1850 -r 1800"
-	if got != want {
-		t.Errorf("cmd: got %q want %q", got, want)
+	if gotName != "/home/jw/npu_turbo" {
+		t.Errorf("bin: got %q want /home/jw/npu_turbo", gotName)
 	}
-	if out != "inject ok\n" {
-		t.Errorf("output: got %q want %q", out, "inject ok\n")
+	if len(gotArgs) != 2 || gotArgs[0] != "-f" || gotArgs[1] != "1850" {
+		t.Errorf("args: got %v want [-f 1850]", gotArgs)
+	}
+	if out != "raise ok\n" {
+		t.Errorf("output: got %q", out)
 	}
 }
 
-func TestSetFreqMissingPlaceholdersLeftAsIs(t *testing.T) {
-	// An old template without {rated} must keep working: absent placeholders
-	// are not substituted (no-op), so the command is unchanged.
-	var got string
-	SetMock(func(ctx context.Context, cmd string) (string, error) { got = cmd; return "", nil })
+func TestRaiseAllPropagatesErrorAndOutput(t *testing.T) {
+	SetMock(func(ctx context.Context, name string, args ...string) (string, error) {
+		return "boom stderr\n", errors.New("exit 2")
+	})
 	defer ResetRunner()
-	_, err := Default().SetFreq(context.Background(),
-		"/home/jw/npu_turbo_one.sh inject -d {id} -f {freq}", 3, 1850, 1800)
-	if err != nil {
-		t.Fatalf("SetFreq: %v", err)
-	}
-	want := "/home/jw/npu_turbo_one.sh inject -d 3 -f 1850"
-	if got != want {
-		t.Errorf("cmd: got %q want %q", got, want)
-	}
-}
-
-func TestSetFreqPropagatesErrorAndOutput(t *testing.T) {
-	SetMock(func(ctx context.Context, cmd string) (string, error) { return "boom stderr\n", errors.New("exit 2") })
-	defer ResetRunner()
-	out, err := Default().SetFreq(context.Background(),
-		"/home/jw/npu_turbo_one.sh inject -d {id} -f {freq} -r {rated}", 1, 1900, 1800)
+	out, err := Default().RaiseAll(context.Background(), "/home/jw/npu_turbo", 1900)
 	if err == nil {
 		t.Fatal("expected error, got nil")
 	}
 	// Output must still be returned on error so the caller can log it.
 	if out != "boom stderr\n" {
-		t.Errorf("output on error: got %q want %q", out, "boom stderr\n")
-	}
-}
-
-func TestCleanExecsAsIs(t *testing.T) {
-	var got string
-	SetMock(func(ctx context.Context, cmd string) (string, error) { got = cmd; return "cleaned all\n", nil })
-	defer ResetRunner()
-	out, err := Default().Clean(context.Background(), "/home/jw/npu_turbo_one.sh clean")
-	if err != nil {
-		t.Fatalf("Clean: %v", err)
-	}
-	want := "/home/jw/npu_turbo_one.sh clean"
-	if got != want {
-		t.Errorf("cmd: got %q want %q", got, want)
-	}
-	if out != "cleaned all\n" {
-		t.Errorf("output: got %q", out)
-	}
-}
-
-func TestCleanPropagatesError(t *testing.T) {
-	SetMock(func(ctx context.Context, cmd string) (string, error) { return "err\n", errors.New("exit 3") })
-	defer ResetRunner()
-	out, err := Default().Clean(context.Background(), "/home/jw/npu_turbo_one.sh clean")
-	if err == nil {
-		t.Fatal("expected error, got nil")
-	}
-	if out != "err\n" {
 		t.Errorf("output on error: got %q", out)
+	}
+	if !strings.Contains(err.Error(), "freq=1900") {
+		t.Errorf("error should mention the frequency: %v", err)
 	}
 }

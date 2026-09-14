@@ -26,24 +26,19 @@ func (f *fakeStraggler) Fetch(ctx context.Context, url string) ([]byte, error) {
 	return f.payload, nil
 }
 
-// fakeFreq implements FreqProvider with a fixed per-npu_id map.
+// fakeFreq implements FreqProvider with a fixed per-device map.
 type fakeFreq struct {
 	m map[int]DeviceFreq
 }
 
 func (f *fakeFreq) DeviceFreqs() map[int]DeviceFreq { return f.m }
 
-const (
-	injectCmd = "/home/jw/npu_turbo_one.sh inject -d {id} -f {freq} -r {rated}"
-	cleanCmd  = "/home/jw/npu_turbo_one.sh clean"
-)
-
 func testConfig() Config {
 	return Config{
 		StragglerURL:     "http://test.invalid/straggler",
 		StragglerTimeout: 5 * time.Second,
+		NpuTurboBin:      "/home/jw/npu_turbo",
 		NpuTurboTimeout:  5 * time.Second,
-		NpuTurboCmd:      injectCmd,
 		StepMhz:          50,
 		DryRun:           false,
 	}
@@ -56,344 +51,223 @@ func testFreqs() FreqProvider {
 		1: {Current: 1800, Rated: 1800},
 		3: {Current: 1800, Rated: 1800},
 		4: {Current: 1800, Rated: 1800},
+		5: {Current: 1800, Rated: 1800},
 	}}
 }
 
-func TestTickBoostsSlowCards(t *testing.T) {
-	tb := &fakeTurbo{}
-	act := NewActuator(tb, injectCmd, cleanCmd, nil)
-	payload := []byte(`{"profiler":{"node_result":[{"hostname":"h","npu":[{"id":1,"cal":{"score":1.1}},{"id":3,"cal":{"score":1.2}}]}],"comm_domain_result":{}}}`)
-	c := NewController(testConfig(), &fakeStraggler{payload: payload}, act, testFreqs(), nil)
+func newTestController(cfg Config, stragg StragglerSource, dvfs *fakeDVFS, raise *fakeRaiser, freqs FreqProvider) *Controller {
+	act := newTestActuator(dvfs, raise)
+	return NewController(cfg, stragg, act, freqs, nil)
+}
+
+// opLog records the controller-actuator operation order via the fakes.
+type opLog struct {
+	mu  chan struct{} // unused placeholder for symmetry
+}
+
+func TestTickCleansThenAboveBatchThenBelowPins(t *testing.T) {
+	// device 1: A=1800, score 1.4 → B=1850 (> rated → above batch).
+	// device 3: A=820 is not in testFreqs; use device 5 at A=1800 with a
+	// score that stays at/below rated: score 1.001 → B=1800 (= rated → pin).
+	payload := []byte(`{"profiler":{"node_result":[{"hostname":"h","npu":[{"id":1,"cal":{"score":1.4}},{"id":5,"cal":{"score":1.001}}]}],"comm_domain_result":{}}}`)
+	dvfs := newFakeDVFS(0, 1, 3, 5)
+	raise := &fakeRaiser{}
+	c := newTestController(testConfig(), &fakeStraggler{payload: payload}, dvfs, raise, testFreqs())
 	c.tick(time.Now())
-	// A=1800, M=1850: 1800*1.1=1980 → round50=2000 → capped at 1850.
-	if act.LastApplied(1) != 1850 {
-		t.Errorf("card1 expected boosted to 1850, got %d", act.LastApplied(1))
+
+	// Exactly one global raise for the above-rated group (device 1 → 1850).
+	if raise.raiseCount() != 1 {
+		t.Fatalf("expected 1 global raise, got %d", raise.raiseCount())
 	}
-	if act.LastApplied(3) != 1850 {
-		t.Errorf("card3 expected boosted to 1850, got %d", act.LastApplied(3))
+	if raise.raises[0].freq != 1850 {
+		t.Errorf("raise freq = %d, want 1850", raise.raises[0].freq)
 	}
-	if tb.injectCount() != 2 || tb.cleanCount() != 0 {
-		t.Errorf("expected 2 injects + 0 cleans, got %d injects + %d cleans", tb.injectCount(), tb.cleanCount())
+	// device 1 is an above-batch target: only the per-cycle clean touched it
+	// (3 ops) — the batch lowering phase skips targets.
+	if got := dvfs.opsFor(1); !equal(got, []string{"close_idle", "set_freq", "open_idle"}) {
+		t.Errorf("above-batch target device 1 ops = %v, want clean-only (3 ops)", got)
 	}
-	// rated from the snapshot must flow through to the inject command.
-	for _, c := range tb.allInjects() {
-		if c.freq != 1850 || c.rated != 1800 {
-			t.Errorf("inject call = %+v, want freq=1850 rated=1800", c)
+	// device 5 is an at-or-below pin AND a non-target of the above batch:
+	// clean(3) + batch lowering to rated(3) + pin(2, no open) = 8 ops, ending
+	// with the pin.
+	ops5 := dvfs.opsFor(5)
+	if len(ops5) != 8 || !equal(ops5[6:], []string{"close_idle", "set_freq"}) {
+		t.Errorf("pin device 5 ops = %v, want 8 ops ending with the pin [close_idle set_freq]", ops5)
+	}
+	// device 5's pin must come after its clean (order: clean → batch → pin).
+	cleanEnd, pinStart := -1, -1
+	for i, c := range dvfs.recorded() {
+		if c.id == 5 && c.op == "close_idle" {
+			switch {
+			case pinStart == -1 && cleanEnd == -1:
+				cleanEnd = i // first close = clean phase
+			case pinStart == -1 && cleanEnd != -1 && i > cleanEnd+2:
+				pinStart = i // the close after the batch lowering = pin phase
+			}
+		}
+	}
+	if cleanEnd == -1 || pinStart == -1 || pinStart < cleanEnd {
+		t.Errorf("device 5 clean must precede its pin: calls=%v", dvfs.recorded())
+	}
+	// Non-target devices restored to their own rated during the batch
+	// lowering (device 0/3: close,set(1800),open).
+	for _, id := range []int{0, 3} {
+		ops := dvfs.opsFor(id)
+		// clean (3 ops) + batch lowering (3 ops) = 6
+		if len(ops) != 6 {
+			t.Errorf("device %d ops = %v, want clean(3) + lower(3)", id, ops)
 		}
 	}
 }
 
-func TestTickUsesCurrentFreqAsA(t *testing.T) {
-	tb := &fakeTurbo{}
-	act := NewActuator(tb, injectCmd, cleanCmd, nil)
-	// A=1700, rated 1800 → M=1850; score 1.05 → 1785 → round50=1800.
-	freqs := &fakeFreq{m: map[int]DeviceFreq{1: {Current: 1700, Rated: 1800}}}
-	payload := []byte(`{"profiler":{"node_result":[{"hostname":"h","npu":[{"id":1,"cal":{"score":1.05}}]}],"comm_domain_result":{}}}`)
-	c := NewController(testConfig(), &fakeStraggler{payload: payload}, act, freqs, nil)
+func TestTickMultipleAboveRatedSingleBatch(t *testing.T) {
+	// devices 1, 3, 5 all A=1800 score 1.4 → all B=1850 → ONE batch call.
+	payload := []byte(`{"profiler":{"node_result":[{"hostname":"h","npu":[{"id":1,"cal":{"score":1.4}},{"id":3,"cal":{"score":1.4}},{"id":5,"cal":{"score":1.4}}]}],"comm_domain_result":{}}}`)
+	dvfs := newFakeDVFS(0, 1, 2, 3, 4, 5)
+	raise := &fakeRaiser{}
+	c := newTestController(testConfig(), &fakeStraggler{payload: payload}, dvfs, raise, testFreqs())
 	c.tick(time.Now())
-	if act.LastApplied(1) != 1800 {
-		t.Errorf("A=1700 score=1.05 → expected 1800, got %d", act.LastApplied(1))
+	if raise.raiseCount() != 1 {
+		t.Fatalf("multiple above-rated targets must share ONE batch, got %d raises", raise.raiseCount())
+	}
+	// None of the targets may be lowered by the batch (they are in the skip
+	// list): they only appear in the clean phase (3 ops each).
+	for _, id := range []int{1, 3, 5} {
+		if ops := dvfs.opsFor(id); len(ops) != 3 {
+			t.Errorf("target device %d ops = %v, want clean-only (3 ops)", id, ops)
+		}
 	}
 }
 
-func TestTickRestoresDisappearedCard(t *testing.T) {
-	tb := &fakeTurbo{}
-	act := NewActuator(tb, injectCmd, cleanCmd, nil)
-	payload1 := []byte(`{"profiler":{"node_result":[{"hostname":"h","npu":[{"id":1,"cal":{"score":1.1}},{"id":3,"cal":{"score":1.2}}]}],"comm_domain_result":{}}}`)
-	c := NewController(testConfig(), &fakeStraggler{payload: payload1}, act, testFreqs(), nil)
+func TestTickEmptyListCleansOnly(t *testing.T) {
+	payload := []byte(`{"profiler":{"node_result":[],"comm_domain_result":{}}}`)
+	dvfs := newFakeDVFS(0, 1)
+	raise := &fakeRaiser{}
+	c := newTestController(testConfig(), &fakeStraggler{payload: payload}, dvfs, raise, testFreqs())
 	c.tick(time.Now())
-	// Second tick: card1 disappeared (recovered); card3 still slow.
-	payload2 := []byte(`{"profiler":{"node_result":[{"hostname":"h","npu":[{"id":3,"cal":{"score":1.2}}]}],"comm_domain_result":{}}}`)
-	tbBefore := tb.injectCount()
-	c2 := NewController(testConfig(), &fakeStraggler{payload: payload2}, act, testFreqs(), nil)
-	c2.tick(time.Now())
-	// Recovery → clean (restore all) + re-inject the still-slow card3.
-	if tb.cleanCount() != 1 {
-		t.Errorf("expected 1 clean on recovery, got %d", tb.cleanCount())
+	if raise.raiseCount() != 0 {
+		t.Errorf("empty list must not raise, got %d", raise.raiseCount())
 	}
-	if tb.injectCount()-tbBefore != 1 {
-		t.Errorf("expected 1 re-inject (card3) on recovery, got %d", tb.injectCount()-tbBefore)
-	}
-	if act.LastApplied(1) != 0 {
-		t.Errorf("card1 should be cleared after clean, got LastApplied=%d", act.LastApplied(1))
-	}
-	if act.LastApplied(3) != 1850 {
-		t.Errorf("card3 should remain boosted at 1850, got %d", act.LastApplied(3))
+	// Clean still ran: every device restored.
+	for _, id := range []int{0, 1} {
+		if got := dvfs.opsFor(id); !equal(got, []string{"close_idle", "set_freq", "open_idle"}) {
+			t.Errorf("device %d ops = %v, want clean", id, got)
+		}
 	}
 }
 
-func TestTickEmptyNodeResultRestoresAll(t *testing.T) {
-	tb := &fakeTurbo{}
-	act := NewActuator(tb, injectCmd, cleanCmd, nil)
-	payload1 := []byte(`{"profiler":{"node_result":[{"hostname":"h","npu":[{"id":1,"cal":{"score":1.1}}]}],"comm_domain_result":{}}}`)
-	c := NewController(testConfig(), &fakeStraggler{payload: payload1}, act, testFreqs(), nil)
+func TestTickAllSkippedCleansOnly(t *testing.T) {
+	// device 2 rated 2000 → unmapped → skipped; no boost, clean only.
+	payload := []byte(`{"profiler":{"node_result":[{"hostname":"h","npu":[{"id":2,"cal":{"score":1.4}}]}],"comm_domain_result":{}}}`)
+	dvfs := newFakeDVFS(0, 2)
+	raise := &fakeRaiser{}
+	freqs := &fakeFreq{m: map[int]DeviceFreq{2: {Current: 2000, Rated: 2000}}}
+	c := newTestController(testConfig(), &fakeStraggler{payload: payload}, dvfs, raise, freqs)
 	c.tick(time.Now())
-	if act.LastApplied(1) == 0 {
-		t.Fatal("expected boost first")
+	if raise.raiseCount() != 0 {
+		t.Errorf("unmapped device must not raise, got %d", raise.raiseCount())
 	}
-	// Empty node_result → all recovered → clean, no inject.
-	payload2 := []byte(`{"profiler":{"node_result":[],"comm_domain_result":{}}}`)
-	tbBeforeInject := tb.injectCount()
-	c2 := NewController(testConfig(), &fakeStraggler{payload: payload2}, act, testFreqs(), nil)
-	c2.tick(time.Now())
-	if tb.cleanCount() != 1 {
-		t.Errorf("expected 1 clean on empty list, got %d", tb.cleanCount())
-	}
-	if tb.injectCount()-tbBeforeInject != 0 {
-		t.Errorf("expected 0 injects on empty list, got %d", tb.injectCount()-tbBeforeInject)
-	}
-	if act.LastApplied(1) != 0 {
-		t.Errorf("card1 should be cleared after clean, got %d", act.LastApplied(1))
+	if got := dvfs.opsFor(2); !equal(got, []string{"close_idle", "set_freq", "open_idle"}) {
+		t.Errorf("device 2 ops = %v, want clean only", got)
 	}
 }
 
-func TestTickScoreChangeNoReinject(t *testing.T) {
-	tb := &fakeTurbo{}
-	act := NewActuator(tb, injectCmd, cleanCmd, nil)
-	// tick1: card1 score=1.1, A=1800 → B=1850 (cap).
-	c := NewController(testConfig(), &fakeStraggler{payload: []byte(`{"profiler":{"node_result":[{"hostname":"h","npu":[{"id":1,"cal":{"score":1.1}}]}],"comm_domain_result":{}}}`)}, act, testFreqs(), nil)
+func TestTickScoreLE1NotBoosted(t *testing.T) {
+	// score 0.9 in the list = not slow → after the clean it stays at rated.
+	payload := []byte(`{"profiler":{"node_result":[{"hostname":"h","npu":[{"id":1,"cal":{"score":0.9}}]}],"comm_domain_result":{}}}`)
+	dvfs := newFakeDVFS(0, 1)
+	raise := &fakeRaiser{}
+	c := newTestController(testConfig(), &fakeStraggler{payload: payload}, dvfs, raise, testFreqs())
 	c.tick(time.Now())
-	if act.LastApplied(1) != 1850 {
-		t.Fatalf("tick1: expected 1850, got %d", act.LastApplied(1))
+	if raise.raiseCount() != 0 {
+		t.Errorf("score≤1 must not boost, got %d raises", raise.raiseCount())
 	}
-	// tick2: card1 score=1.12 (still >1), A=1800 unchanged → B still 1850 (cap).
-	// Same B → idempotent, no re-inject, no clean.
-	tbBefore := tb.injectCount()
-	cleanBefore := tb.cleanCount()
-	c2 := NewController(testConfig(), &fakeStraggler{payload: []byte(`{"profiler":{"node_result":[{"hostname":"h","npu":[{"id":1,"cal":{"score":1.12}}]}],"comm_domain_result":{}}}`)}, act, testFreqs(), nil)
-	c2.tick(time.Now())
-	if tb.cleanCount()-cleanBefore != 0 {
-		t.Errorf("no recovery → no clean, got %d cleans", tb.cleanCount()-cleanBefore)
-	}
-	if tb.injectCount()-tbBefore != 0 {
-		t.Errorf("score change but B unchanged (capped) → 0 re-injects, got %d", tb.injectCount()-tbBefore)
-	}
-	if act.LastApplied(1) != 1850 {
-		t.Errorf("card1 should remain at 1850, got %d", act.LastApplied(1))
+	if got := dvfs.opsFor(1); !equal(got, []string{"close_idle", "set_freq", "open_idle"}) {
+		t.Errorf("device 1 ops = %v, want clean only", got)
 	}
 }
 
-func TestTickNewCardNoClean(t *testing.T) {
-	tb := &fakeTurbo{}
-	act := NewActuator(tb, injectCmd, cleanCmd, nil)
-	// tick1: only card1 (A=1800, score 1.1 → 1850).
-	c := NewController(testConfig(), &fakeStraggler{payload: []byte(`{"profiler":{"node_result":[{"hostname":"h","npu":[{"id":1,"cal":{"score":1.1}}]}],"comm_domain_result":{}}}`)}, act, testFreqs(), nil)
+func TestTickAboveCapSkipped(t *testing.T) {
+	// device 1 current 1900 > cap 1850 → skipped (never boosted above rated).
+	payload := []byte(`{"profiler":{"node_result":[{"hostname":"h","npu":[{"id":1,"cal":{"score":1.4}}]}],"comm_domain_result":{}}}`)
+	dvfs := newFakeDVFS(0, 1)
+	raise := &fakeRaiser{}
+	freqs := &fakeFreq{m: map[int]DeviceFreq{1: {Current: 1900, Rated: 1800}}}
+	c := newTestController(testConfig(), &fakeStraggler{payload: payload}, dvfs, raise, freqs)
 	c.tick(time.Now())
-	// tick2: card1 (unchanged) + new card4 (score 1.2 → 1850). No recovery →
-	// inject only the new card, no clean.
-	tbBefore := tb.injectCount()
-	cleanBefore := tb.cleanCount()
-	c2 := NewController(testConfig(), &fakeStraggler{payload: []byte(`{"profiler":{"node_result":[{"hostname":"h","npu":[{"id":1,"cal":{"score":1.1}},{"id":4,"cal":{"score":1.2}}]}],"comm_domain_result":{}}}`)}, act, testFreqs(), nil)
-	c2.tick(time.Now())
-	if tb.cleanCount()-cleanBefore != 0 {
-		t.Errorf("no recovery → no clean, got %d cleans", tb.cleanCount()-cleanBefore)
+	if raise.raiseCount() != 0 {
+		t.Errorf("above-cap device must not boost, got %d", raise.raiseCount())
 	}
-	if tb.injectCount()-tbBefore != 1 {
-		t.Errorf("only the new card should be injected, got %d injects", tb.injectCount()-tbBefore)
-	}
-	if act.LastApplied(1) != 1850 || act.LastApplied(4) != 1850 {
-		t.Errorf("lastApplied: 1=%d (want 1850), 4=%d (want 1850)", act.LastApplied(1), act.LastApplied(4))
+	// Clean still ran (device 1 restored to rated).
+	if got := dvfs.opsFor(1); !equal(got, []string{"close_idle", "set_freq", "open_idle"}) {
+		t.Errorf("device 1 ops = %v, want clean only", got)
 	}
 }
 
-func TestTickDryRunNoExec(t *testing.T) {
-	tb := &fakeTurbo{}
-	act := NewActuator(tb, injectCmd, cleanCmd, nil)
+func TestTickDryRunNoOps(t *testing.T) {
+	payload := []byte(`{"profiler":{"node_result":[{"hostname":"h","npu":[{"id":1,"cal":{"score":1.4}}]}],"comm_domain_result":{}}}`)
 	cfg := testConfig()
 	cfg.DryRun = true
-	c := NewController(cfg, &fakeStraggler{payload: []byte(`{"profiler":{"node_result":[{"hostname":"h","npu":[{"id":1,"cal":{"score":1.1}}]}],"comm_domain_result":{}}}`)}, act, testFreqs(), nil)
+	dvfs := newFakeDVFS(0, 1)
+	raise := &fakeRaiser{}
+	c := newTestController(cfg, &fakeStraggler{payload: payload}, dvfs, raise, testFreqs())
 	c.tick(time.Now())
-	if tb.injectCount() != 0 || tb.cleanCount() != 0 {
-		t.Errorf("dry_run must not exec, got %d injects + %d cleans", tb.injectCount(), tb.cleanCount())
-	}
-	if act.LastApplied(1) != 0 {
-		t.Errorf("dry_run must not boost, got %d", act.LastApplied(1))
+	if raise.raiseCount() != 0 || len(dvfs.recorded()) != 0 {
+		t.Errorf("dry_run must not touch hardware, got %d raises + %d dvfs calls",
+			raise.raiseCount(), len(dvfs.recorded()))
 	}
 }
 
-func TestTickStragglerFailureNoOpsAndDoesNotRestore(t *testing.T) {
-	tb := &fakeTurbo{}
-	act := NewActuator(tb, injectCmd, cleanCmd, nil)
-	// Pre-boost card1 so we can verify a straggler failure does NOT clean it
-	// (cannot reconcile desired state without a fresh list).
-	_ = act.Boost(context.Background(), 1, 1850, 1800)
-	injectBefore := tb.injectCount()
-	cleanBefore := tb.cleanCount()
-	c := NewController(testConfig(), &fakeStraggler{err: errors.New("straggler exec failed")}, act, testFreqs(), nil)
+func TestTickStragglerFailureFullNoOp(t *testing.T) {
+	dvfs := newFakeDVFS(0, 1)
+	raise := &fakeRaiser{}
+	c := newTestController(testConfig(), &fakeStraggler{err: errors.New("straggler fetch failed")}, dvfs, raise, testFreqs())
 	c.tick(time.Now())
-	if tb.injectCount()-injectBefore != 0 || tb.cleanCount()-cleanBefore != 0 {
-		t.Errorf("straggler failure should trigger no exec, got %d injects + %d cleans",
-			tb.injectCount()-injectBefore, tb.cleanCount()-cleanBefore)
-	}
-	if act.LastApplied(1) != 1850 {
-		t.Errorf("straggler failure should leave boosted state untouched, got LastApplied=%d", act.LastApplied(1))
+	if raise.raiseCount() != 0 || len(dvfs.recorded()) != 0 {
+		t.Errorf("straggler failure must be a full no-op (not even clean), got %d raises + %d dvfs calls",
+			raise.raiseCount(), len(dvfs.recorded()))
 	}
 }
 
-func TestTickEmptyFreqMapNoOpsAndDoesNotRestore(t *testing.T) {
-	tb := &fakeTurbo{}
-	act := NewActuator(tb, injectCmd, cleanCmd, nil)
-	// Pre-boost card1 so we can verify a missing snapshot (empty freq map)
-	// does NOT clean it — same no-input-no-actuation rule as a straggler
-	// failure.
-	_ = act.Boost(context.Background(), 1, 1850, 1800)
-	injectBefore := tb.injectCount()
-	cleanBefore := tb.cleanCount()
-	payload := []byte(`{"profiler":{"node_result":[{"hostname":"h","npu":[{"id":1,"cal":{"score":1.1}}]}],"comm_domain_result":{}}}`)
-	c := NewController(testConfig(), &fakeStraggler{payload: payload}, act, &fakeFreq{m: map[int]DeviceFreq{}}, nil)
+func TestTickEmptyFreqMapFullNoOp(t *testing.T) {
+	payload := []byte(`{"profiler":{"node_result":[{"hostname":"h","npu":[{"id":1,"cal":{"score":1.4}}]}],"comm_domain_result":{}}}`)
+	dvfs := newFakeDVFS(0, 1)
+	raise := &fakeRaiser{}
+	c := newTestController(testConfig(), &fakeStraggler{payload: payload}, dvfs, raise, &fakeFreq{m: map[int]DeviceFreq{}})
 	c.tick(time.Now())
-	if tb.injectCount()-injectBefore != 0 || tb.cleanCount()-cleanBefore != 0 {
-		t.Errorf("empty freq map should trigger no exec, got %d injects + %d cleans",
-			tb.injectCount()-injectBefore, tb.cleanCount()-cleanBefore)
-	}
-	if act.LastApplied(1) != 1850 {
-		t.Errorf("empty freq map should leave boosted state untouched, got LastApplied=%d", act.LastApplied(1))
+	if raise.raiseCount() != 0 || len(dvfs.recorded()) != 0 {
+		t.Errorf("empty freq map must be a full no-op, got %d raises + %d dvfs calls",
+			raise.raiseCount(), len(dvfs.recorded()))
 	}
 }
 
-func TestTickMissingFreqDataSkipsCard(t *testing.T) {
-	tb := &fakeTurbo{}
-	act := NewActuator(tb, injectCmd, cleanCmd, nil)
-	// device3 has freq data; card7 is absent from the snapshot → skipped, not
-	// boosted, and not part of desired (no clean triggered by it either).
-	freqs := &fakeFreq{m: map[int]DeviceFreq{3: {Current: 1800, Rated: 1800}}}
-	payload := []byte(`{"profiler":{"node_result":[{"hostname":"h","npu":[{"id":3,"cal":{"score":1.1}},{"id":7,"cal":{"score":1.2}}]}],"comm_domain_result":{}}}`)
-	c := NewController(testConfig(), &fakeStraggler{payload: payload}, act, freqs, nil)
+func TestTickCleanFailureStillBoosts(t *testing.T) {
+	payload := []byte(`{"profiler":{"node_result":[{"hostname":"h","npu":[{"id":1,"cal":{"score":1.4}}]}],"comm_domain_result":{}}}`)
+	dvfs := newFakeDVFS(0, 1)
+	dvfs.failSet = map[int]error{0: errDVFS} // clean fails on device 0
+	raise := &fakeRaiser{}
+	c := newTestController(testConfig(), &fakeStraggler{payload: payload}, dvfs, raise, testFreqs())
 	c.tick(time.Now())
-	if act.LastApplied(3) != 1850 {
-		t.Errorf("card3 expected boosted to 1850, got %d", act.LastApplied(3))
-	}
-	if act.LastApplied(7) != 0 {
-		t.Errorf("device7 without freq data must be skipped, got %d", act.LastApplied(7))
-	}
-	if tb.injectCount() != 1 || tb.cleanCount() != 0 {
-		t.Errorf("expected 1 inject + 0 cleans, got %d injects + %d cleans", tb.injectCount(), tb.cleanCount())
+	// The boost still happens despite the clean failure.
+	if raise.raiseCount() != 1 {
+		t.Errorf("boosts must continue after a clean failure, got %d raises", raise.raiseCount())
 	}
 }
 
-func TestTickUnmappedRatedSkipsCard(t *testing.T) {
-	tb := &fakeTurbo{}
-	act := NewActuator(tb, injectCmd, cleanCmd, nil)
-	// device1 rated 1800 (in map → M=1850); card2 rated 2000 (not in map → skip).
-	freqs := &fakeFreq{m: map[int]DeviceFreq{
-		1: {Current: 1800, Rated: 1800},
-		2: {Current: 2000, Rated: 2000},
-	}}
-	payload := []byte(`{"profiler":{"node_result":[{"hostname":"h","npu":[{"id":1,"cal":{"score":1.1}},{"id":2,"cal":{"score":1.1}}]}],"comm_domain_result":{}}}`)
-	c := NewController(testConfig(), &fakeStraggler{payload: payload}, act, freqs, nil)
+func TestTickMissingFreqDataSkipsDevice(t *testing.T) {
+	// device 3 has freq data; device 7 is absent from the snapshot → skipped.
+	payload := []byte(`{"profiler":{"node_result":[{"hostname":"h","npu":[{"id":3,"cal":{"score":1.4}},{"id":7,"cal":{"score":1.4}}]}],"comm_domain_result":{}}}`)
+	dvfs := newFakeDVFS(3, 7)
+	raise := &fakeRaiser{}
+	c := newTestController(testConfig(), &fakeStraggler{payload: payload}, dvfs, raise, testFreqs())
 	c.tick(time.Now())
-	if act.LastApplied(1) != 1850 {
-		t.Errorf("card1 (rated 1800) expected boosted to 1850, got %d", act.LastApplied(1))
+	if raise.raiseCount() != 1 {
+		t.Fatalf("device 3 should be boosted, got %d raises", raise.raiseCount())
 	}
-	if act.LastApplied(2) != 0 {
-		t.Errorf("card2 (rated 2000, unmapped) must be skipped, got %d", act.LastApplied(2))
-	}
-	if tb.injectCount() != 1 || tb.cleanCount() != 0 {
-		t.Errorf("expected 1 inject + 0 cleans, got %d injects + %d cleans", tb.injectCount(), tb.cleanCount())
-	}
-}
-
-func TestTickBoostedCardAtTargetStaysInPlan(t *testing.T) {
-	tb := &fakeTurbo{}
-	act := NewActuator(tb, injectCmd, cleanCmd, nil)
-	payload := []byte(`{"profiler":{"node_result":[{"hostname":"h","npu":[{"id":1,"cal":{"score":1.1}}]}],"comm_domain_result":{}}}`)
-	// tick1: A=1800 → B=1850, injected.
-	c := NewController(testConfig(), &fakeStraggler{payload: payload}, act, testFreqs(), nil)
-	c.tick(time.Now())
-	if act.LastApplied(1) != 1850 {
-		t.Fatalf("tick1: expected 1850, got %d", act.LastApplied(1))
-	}
-	// tick2: the snapshot now reflects our own inject (A=1850). ComputeTargetB
-	// no longer skips on B<=A, so the card stays in desired with B=1850 → not
-	// recovered → no clean; LastApplied==B → idempotent skip. Zero exec.
-	freqs := &fakeFreq{m: map[int]DeviceFreq{1: {Current: 1850, Rated: 1800}}}
-	injectBefore := tb.injectCount()
-	cleanBefore := tb.cleanCount()
-	c2 := NewController(testConfig(), &fakeStraggler{payload: payload}, act, freqs, nil)
-	c2.tick(time.Now())
-	if tb.cleanCount()-cleanBefore != 0 {
-		t.Errorf("boosted card at target must not trigger clean, got %d cleans", tb.cleanCount()-cleanBefore)
-	}
-	if tb.injectCount()-injectBefore != 0 {
-		t.Errorf("boosted card at target is idempotent, got %d injects", tb.injectCount()-injectBefore)
-	}
-	if act.LastApplied(1) != 1850 {
-		t.Errorf("card1 should stay at 1850, got %d", act.LastApplied(1))
-	}
-}
-
-func TestTickScoreLE1InListTreatedAsAbsent(t *testing.T) {
-	tb := &fakeTurbo{}
-	act := NewActuator(tb, injectCmd, cleanCmd, nil)
-	// tick1: card1 + card3 slow → both boosted to 1850.
-	payload1 := []byte(`{"profiler":{"node_result":[{"hostname":"h","npu":[{"id":1,"cal":{"score":1.1}},{"id":3,"cal":{"score":1.2}}]}],"comm_domain_result":{}}}`)
-	c := NewController(testConfig(), &fakeStraggler{payload: payload1}, act, testFreqs(), nil)
-	c.tick(time.Now())
-	if act.LastApplied(1) != 1850 || act.LastApplied(3) != 1850 {
-		t.Fatalf("tick1: expected both boosted to 1850, got 1=%d 3=%d", act.LastApplied(1), act.LastApplied(3))
-	}
-	// tick2: card1 still listed but score=0.9 (≤1 → equivalent to not listed
-	// → recovered); card3 still slow. Expect clean + re-inject card3 only.
-	payload2 := []byte(`{"profiler":{"node_result":[{"hostname":"h","npu":[{"id":1,"cal":{"score":0.9}},{"id":3,"cal":{"score":1.2}}]}],"comm_domain_result":{}}}`)
-	tbBefore := tb.injectCount()
-	c2 := NewController(testConfig(), &fakeStraggler{payload: payload2}, act, testFreqs(), nil)
-	c2.tick(time.Now())
-	if tb.cleanCount() != 1 {
-		t.Errorf("score≤1 in list should trigger clean, got %d cleans", tb.cleanCount())
-	}
-	if tb.injectCount()-tbBefore != 1 {
-		t.Errorf("expected 1 re-inject (card3), got %d", tb.injectCount()-tbBefore)
-	}
-	if act.LastApplied(1) != 0 {
-		t.Errorf("card1 should be cleared after clean, got LastApplied=%d", act.LastApplied(1))
-	}
-	if act.LastApplied(3) != 1850 {
-		t.Errorf("card3 should remain boosted at 1850, got %d", act.LastApplied(3))
-	}
-}
-
-func TestTickCurrentAboveCapSkipsWithoutClean(t *testing.T) {
-	tb := &fakeTurbo{}
-	act := NewActuator(tb, injectCmd, cleanCmd, nil)
-	// tick1: card1 slow, A=1800 → boosted to 1850.
-	payload := []byte(`{"profiler":{"node_result":[{"hostname":"h","npu":[{"id":1,"cal":{"score":1.1}}]}],"comm_domain_result":{}}}`)
-	c := NewController(testConfig(), &fakeStraggler{payload: payload}, act, testFreqs(), nil)
-	c.tick(time.Now())
-	if act.LastApplied(1) != 1850 {
-		t.Fatalf("tick1: expected 1850, got %d", act.LastApplied(1))
-	}
-	// tick2: card1 still slow (score>1) but its current freq reads 1900 —
-	// above the map cap 1850. Never downclock: skipped, and since it is still
-	// listed with score>1 it is NOT recovered → no clean, no inject.
-	freqs := &fakeFreq{m: map[int]DeviceFreq{1: {Current: 1900, Rated: 1800}}}
-	injectBefore := tb.injectCount()
-	cleanBefore := tb.cleanCount()
-	c2 := NewController(testConfig(), &fakeStraggler{payload: payload}, act, freqs, nil)
-	c2.tick(time.Now())
-	if tb.injectCount()-injectBefore != 0 || tb.cleanCount()-cleanBefore != 0 {
-		t.Errorf("A above cap must be a no-op, got %d injects + %d cleans",
-			tb.injectCount()-injectBefore, tb.cleanCount()-cleanBefore)
-	}
-	if act.LastApplied(1) != 1850 {
-		t.Errorf("card1 state should be untouched, got LastApplied=%d", act.LastApplied(1))
-	}
-}
-
-func TestTickPartialFreqDataSkipsCard(t *testing.T) {
-	tb := &fakeTurbo{}
-	act := NewActuator(tb, injectCmd, cleanCmd, nil)
-	// device1 has current but no rated (Rated=0) → skipped; card3 complete.
-	freqs := &fakeFreq{m: map[int]DeviceFreq{
-		1: {Current: 1800},
-		3: {Current: 1800, Rated: 1800},
-	}}
-	payload := []byte(`{"profiler":{"node_result":[{"hostname":"h","npu":[{"id":1,"cal":{"score":1.1}},{"id":3,"cal":{"score":1.1}}]}],"comm_domain_result":{}}}`)
-	c := NewController(testConfig(), &fakeStraggler{payload: payload}, act, freqs, nil)
-	c.tick(time.Now())
-	if act.LastApplied(1) != 0 {
-		t.Errorf("card1 without rated freq must be skipped, got %d", act.LastApplied(1))
-	}
-	if act.LastApplied(3) != 1850 {
-		t.Errorf("card3 expected boosted to 1850, got %d", act.LastApplied(3))
+	// device 7 only got the clean + batch lowering (it is on the node but not
+	// a boost target) — never a raise target.
+	ops7 := dvfs.opsFor(7)
+	if len(ops7) != 6 {
+		t.Errorf("device 7 ops = %v, want clean(3) + batch lower(3)", ops7)
 	}
 }

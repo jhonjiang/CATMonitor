@@ -1,9 +1,10 @@
-// Package npu_turbo provides an exec source that drives the external
-// npu_turbo tool, which has two operations: inject raises a single card's
-// frequency, clean restores ALL cards to baseline. Mirrors the
-// straggler/npu_smi exec-source pattern: singleton, runner seam. The runner
-// returns the command's combined stdout+stderr so callers can log what the
-// tool printed (the daemon surfaces npu_turbo_one.sh output in journalctl).
+// Package npu_turbo execs the external npu_turbo tool, which raises ALL
+// devices' frequency at once — the only supported way to exceed a device's
+// rated frequency (per-device DSMI sets are capped at rated, and on
+// dual-chip cards the slave die cannot run above the master die). Mirrors
+// the repo's exec-source pattern: singleton, runner seam. The runner returns
+// the command's combined stdout+stderr so callers can log what the tool
+// printed (the daemon surfaces npu_turbo output in journalctl).
 package npu_turbo
 
 import (
@@ -11,22 +12,20 @@ import (
 	"fmt"
 	"os/exec"
 	"strconv"
-	"strings"
 	"sync"
 )
 
-// Source drives the npu_turbo tool. SetFreq = inject (per-card boost);
-// Clean = restore all cards to baseline. Both return the command's combined
+// Source drives the npu_turbo tool. RaiseAll execs `<bin> -f <freqMHz>` to
+// raise every device to freqMHz, and returns the command's combined
 // stdout+stderr (even on error) so the caller can log it.
 type Source interface {
-	SetFreq(ctx context.Context, cmdTemplate string, cardID, freqMHz, ratedMHz int) (string, error)
-	Clean(ctx context.Context, cleanCmd string) (string, error)
+	RaiseAll(ctx context.Context, bin string, freqMHz int) (string, error)
 }
 
-type runner = func(ctx context.Context, cmd string) (string, error)
+type runner = func(ctx context.Context, name string, args ...string) (string, error)
 
-func realRun(ctx context.Context, cmd string) (string, error) {
-	out, err := exec.CommandContext(ctx, "sh", "-c", cmd).CombinedOutput()
+func realRun(ctx context.Context, name string, args ...string) (string, error) {
+	out, err := exec.CommandContext(ctx, name, args...).CombinedOutput()
 	return string(out), err
 }
 
@@ -41,7 +40,7 @@ var (
 
 func Default() Source { return defaultSrc }
 
-func SetMock(fn func(ctx context.Context, cmd string) (string, error)) {
+func SetMock(fn func(ctx context.Context, name string, args ...string) (string, error)) {
 	mu.Lock()
 	defer mu.Unlock()
 	defaultSrc.runner = fn
@@ -53,35 +52,15 @@ func ResetRunner() {
 	defaultSrc.runner = realRun
 }
 
-// SetFreq execs the inject command (e.g.
-// "/home/jw/npu_turbo_one.sh inject -d {id} -f {freq} -r {rated}")
-// with {id}/{freq}/{rated} substituted, to boost a single card. Placeholders
-// absent from the template are left alone (backward compatible), so an old
-// "-d {id} -f {freq}" template works unchanged. Returns the combined
-// output + error.
-func (s *defaultSource) SetFreq(ctx context.Context, cmdTemplate string, cardID, freqMHz, ratedMHz int) (string, error) {
-	cmd := strings.ReplaceAll(cmdTemplate, "{id}", strconv.Itoa(cardID))
-	cmd = strings.ReplaceAll(cmd, "{freq}", strconv.Itoa(freqMHz))
-	cmd = strings.ReplaceAll(cmd, "{rated}", strconv.Itoa(ratedMHz))
+// RaiseAll execs the npu_turbo binary as `<bin> -f <freqMHz>` to raise all
+// devices to freqMHz. Returns the combined output + error.
+func (s *defaultSource) RaiseAll(ctx context.Context, bin string, freqMHz int) (string, error) {
 	mu.Lock()
 	r := s.runner
 	mu.Unlock()
-	out, err := r(ctx, cmd)
+	out, err := r(ctx, bin, "-f", strconv.Itoa(freqMHz))
 	if err != nil {
-		return out, fmt.Errorf("npu_turbo SetFreq(id=%d freq=%d rated=%d): %w", cardID, freqMHz, ratedMHz, err)
-	}
-	return out, nil
-}
-
-// Clean execs the clean command (e.g. "/home/jw/npu_turbo_one.sh clean")
-// as-is to restore all cards to baseline. Returns the combined output + error.
-func (s *defaultSource) Clean(ctx context.Context, cleanCmd string) (string, error) {
-	mu.Lock()
-	r := s.runner
-	mu.Unlock()
-	out, err := r(ctx, cleanCmd)
-	if err != nil {
-		return out, fmt.Errorf("npu_turbo Clean: %w", err)
+		return out, fmt.Errorf("npu_turbo RaiseAll(bin=%s freq=%d): %w", bin, freqMHz, err)
 	}
 	return out, nil
 }

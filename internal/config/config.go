@@ -117,22 +117,23 @@ type EnergysaveConfig struct {
 
 // NputurboConfig holds the NPU slow-card upclock actuator (nputurbo)
 // configuration (SPEC: features/nputurbo/nputurbo_SPEC.md). The slow-card
-// result is fetched via HTTP GET straggler_url (no local exec); per-card
-// current + rated frequencies are read from snapshot_npu.json (requires
-// snapshot.enabled). The feature is off by default and starts in dry_run
-// (judge+log) mode. M comes from the static rated→max map (1800→1850), not
-// from config.
+// result is fetched via HTTP GET straggler_url; per-device current + rated
+// frequencies are read from snapshot_npu.json (requires snapshot.enabled).
+// Frequency control is native (DSMI via internal/source/npu_dvfs, the former
+// dvfs.py semantics); only the above-rated global raise execs the external
+// npu_turbo binary at npu_turbo_bin. The feature is off by default and
+// starts in dry_run (judge+log) mode. M comes from the static rated→max map
+// (1800→1850), not from config.
 type NputurboConfig struct {
 	Enabled           bool          `yaml:"enabled"`             // default false
 	Interval          time.Duration `yaml:"interval"`            // control loop period (HTTP poll cadence)
 	StragglerURL      string        `yaml:"straggler_url"`       // HTTP GET endpoint returning the slow-card result (profiler doc)
 	StragglerTimeout  time.Duration `yaml:"straggler_timeout"`   // HTTP GET timeout
-	NpuTurboCmd       string        `yaml:"npu_turbo_cmd"`       // inject command template; {id}/{freq}/{rated} replaced (absent placeholders left as-is)
-	NpuTurboCleanCmd  string        `yaml:"npu_turbo_clean_cmd"` // clean command (restores all cards); run as-is
+	NpuTurboBin       string        `yaml:"npu_turbo_bin"`       // npu_turbo binary (above-rated global raise; exec'd as `<bin> -f <MHz>`)
 	NpuTurboTimeout   time.Duration `yaml:"npu_turbo_timeout"`   // npu_turbo exec timeout
 	StepMhz           int           `yaml:"step_mhz"`            // boost target quantization step
-	DryRun            bool          `yaml:"dry_run"`             // true = judge+log only, no npu_turbo exec
-	RestoreOnShutdown bool          `yaml:"restore_on_shutdown"` // restore boosted freqs on graceful shutdown
+	DryRun            bool          `yaml:"dry_run"`             // true = judge+log only, no frequency changes
+	RestoreOnShutdown bool          `yaml:"restore_on_shutdown"` // restore all devices to rated on graceful shutdown
 }
 
 // Default returns the default configuration.
@@ -195,8 +196,7 @@ func Default() *Config {
 			Interval:          60 * time.Second,
 			StragglerURL:      "",
 			StragglerTimeout:  10 * time.Second,
-			NpuTurboCmd:       "/home/jw/npu_turbo_one.sh inject -d {id} -f {freq} -r {rated}",
-			NpuTurboCleanCmd:  "/home/jw/npu_turbo_one.sh clean",
+			NpuTurboBin:       "/home/jw/npu_turbo",
 			NpuTurboTimeout:   120 * time.Second,
 			StepMhz:           50,
 			DryRun:            true,

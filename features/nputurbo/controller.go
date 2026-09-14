@@ -18,7 +18,7 @@ type Config struct {
 	Interval          time.Duration
 	StragglerURL      string
 	StragglerTimeout  time.Duration
-	NpuTurboCmd       string
+	NpuTurboBin       string // npu_turbo binary (global above-rated raise)
 	NpuTurboTimeout   time.Duration
 	StepMhz           int
 	DryRun            bool
@@ -39,12 +39,14 @@ type StragglerSource interface {
 	Fetch(ctx context.Context, url string) ([]byte, error)
 }
 
-// Controller is the nputurbo control loop. Each tick it fetches the straggler
-// slow-device result over HTTP (GET straggler_url), reads per-device current +
-// rated frequencies from the FreqProvider (snapshot_npu.json), computes target
-// freqs B = roundStep(min(A*score, M)) with A = aicore_freq and M looked up
-// from aicore_rated_freq via the static rated→max table, reconciles the
-// boosted set (restore disappeared, boost listed), and emits state metrics.
+// Controller is the nputurbo control loop. Stateless model: each tick it
+// fetches the straggler slow-device result over HTTP, reads per-device
+// current + rated frequencies from the FreqProvider (snapshot_npu.json),
+// computes target freqs B = roundStep(min(A*score, M)) with A = aicore_freq
+// and M from the static rated→max table, then restores ALL devices to rated
+// and re-applies the boost set from the fresh list: above-rated targets in
+// one batch (global raise via the npu_turbo tool + lower the others), then
+// at-or-below-rated targets pinned individually. No cross-tick state.
 type Controller struct {
 	cfg      Config
 	stragg   StragglerSource
@@ -85,111 +87,82 @@ func (c *Controller) Run(ctx context.Context) {
 	}
 }
 
-// Restore is the best-effort shutdown hook: restore all boosted cards.
+// Restore is the best-effort shutdown hook: restore all devices to rated.
 func (c *Controller) Restore() {
 	if !c.cfg.RestoreOnShutdown {
 		return
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-	if err := c.actuator.RestoreAll(ctx); err != nil {
-		c.logger.Error("nputurbo shutdown restore failed", "error", err)
+	if err := c.actuator.CleanAll(); err != nil {
+		c.logger.Error("nputurbo: shutdown restore failed", "error", err)
 	}
 }
 
-// tick is exported for tests; it runs one control cycle.
+// tick is exported for tests; it runs one control cycle. Stateless: restore
+// everything, then apply the fresh boost list (above-rated batch first, then
+// per-device pins — the order matters because the above-rated batch's
+// lower-others step would overwrite earlier per-device pins).
 func (c *Controller) tick(now time.Time) {
 	// planBoosts runs straggler + parse + per-device A/M lookup (no
-	// actuation). On straggler/parse failure — or a completely missing
-	// frequency input (freqs map empty: snapshot_npu.json unreadable) — it
-	// returns err → complete no-op: we have no fresh list to reconcile
-	// against, so the previously-boosted state is left untouched (not
-	// restored).
+	// actuation). On failure it returns err → complete no-op: we have no
+	// fresh list to act on, so nothing is cleaned or boosted either.
 	p, err := c.planBoosts()
 	if err != nil {
 		c.logger.Error("nputurbo: cannot build boost plan this cycle; no boost and no restore", "error", err)
 		return
 	}
-	// Reconcile to desired state. desired = {id: target} for every listed
-	// device with score>1 (and processable freq data). The target carries the
-	// boost frequency B plus the device's rated freq, both passed through to
-	// the inject command. Devices already at their target stay in desired —
-	// ComputeTargetB no longer skips on B<=A — so a boosted device is only
-	// "recovered" when it leaves that set.
-	desired := make(map[int]injectTarget, len(p.rows))
-	for _, r := range p.rows {
-		desired[r.ID] = injectTarget{B: r.B, Rated: r.Rated}
-	}
 	c.logger.Info(fmt.Sprintf("nputurbo: %d slow device(s) reported, %d to boost, %d skipped",
-		len(p.cards), len(desired), len(p.skipped)))
+		len(p.cards), len(p.rows), len(p.skipped)))
 	if c.cfg.DryRun {
 		for _, r := range p.rows {
 			c.logger.Info(fmt.Sprintf("nputurbo dry-run: would boost device %d from %d to %d MHz (score %.2f, rated %d, cap %d)",
 				r.ID, r.A, r.B, r.Score, r.Rated, r.M))
 		}
-		c.emitMetrics(now)
+		c.emitMetrics(now, len(p.rows))
 		return
 	}
-	current := c.actuator.LastAppliedMap()
-	// A boosted device has recovered when it is no longer listed, or its
-	// listed score is <= 1 (equivalent to not listed). Devices skipped for
-	// other reasons (missing freq data / unmapped rating / A above cap) are
-	// still slow — they never count as recovered. Since clean is
-	// all-or-nothing, any recovery forces clean + full re-inject (still-slow
-	// devices are re-boosted after clean). When no device recovered, only
-	// inject new/changed devices (idempotent re-set; no flicker on stable
-	// devices).
-	listedScore := make(map[int]float64, len(p.cards))
-	for _, sc := range p.cards {
-		listedScore[sc.ID] = sc.Score
+	// 1. Restore every device to its own rated frequency. This resets any
+	// previous boost before the fresh list is applied, so recovered devices
+	// simply stay at rated. A failure is logged but does not stop the boosts.
+	if err := c.actuator.CleanAll(); err != nil {
+		c.logger.Error("nputurbo: failed to restore all devices to rated; continuing with boosts", "error", err)
 	}
-	recoveredCount := 0
-	for id := range current {
-		score, listed := listedScore[id]
-		if !listed || score <= 1.0 {
-			recoveredCount++
-		}
-	}
-	if recoveredCount > 0 && len(current) > 0 {
-		c.logger.Info(fmt.Sprintf("nputurbo: %d boosted device(s) recovered — restored all devices to baseline, re-boosting %d still-slow device(s)",
-			recoveredCount, len(desired)))
-		rctx, rcancel := context.WithTimeout(context.Background(), c.npuTurboTimeout())
-		_ = c.actuator.RestoreAll(rctx) // actuator logs clean success/failure incl. output
-		rcancel()
-		for id, t := range desired {
-			bctx, bcancel := context.WithTimeout(context.Background(), c.npuTurboTimeout())
-			_ = c.actuator.Boost(bctx, id, t.B, t.Rated) // actuator logs inject incl. output
-			bcancel()
-		}
-	} else {
-		injected := 0
-		for id, t := range desired {
-			if c.actuator.LastApplied(id) == t.B {
-				continue // idempotent: already at target
+	// 2. Above-rated targets: one batch — global raise to maxB via the
+	// npu_turbo tool, then lower every non-target to its own rated. Must run
+	// BEFORE the at-or-below pins (the lower step would overwrite them). All
+	// above-rated B values equal M under the current rated→max map (the cap
+	// is one step above rated), so a single raise frequency covers the group.
+	var aboveIDs []int
+	maxAbove := 0
+	var belowRows []BoostRow
+	for _, r := range p.rows {
+		if r.B > r.Rated {
+			aboveIDs = append(aboveIDs, r.ID)
+			if r.B > maxAbove {
+				maxAbove = r.B
 			}
-			bctx, bcancel := context.WithTimeout(context.Background(), c.npuTurboTimeout())
-			if err := c.actuator.Boost(bctx, id, t.B, t.Rated); err == nil {
-				injected++
-			} // actuator logs inject success/failure incl. output
-			bcancel()
-		}
-		switch {
-		case injected > 0:
-			c.logger.Info(fmt.Sprintf("nputurbo: boosted %d new/changed device(s); %d already at target, untouched",
-				injected, len(desired)-injected))
-		case len(desired) > 0:
-			c.logger.Info(fmt.Sprintf("nputurbo: %d boosted device(s) already at target frequency; nothing to do", len(desired)))
+		} else {
+			belowRows = append(belowRows, r)
 		}
 	}
-	c.emitMetrics(now)
-}
-
-// injectTarget is one device's desired boost state: the target frequency B
-// plus the device's rated frequency, both passed through to the npu_turbo
-// tool's inject command (-r {rated}).
-type injectTarget struct {
-	B     int // target freq (MHz)
-	Rated int // aicore_rated_freq (MHz)
+	if len(aboveIDs) > 0 {
+		rctx, rcancel := context.WithTimeout(context.Background(), c.npuTurboTimeout())
+		err := c.actuator.BoostAbove(rctx, aboveIDs, maxAbove)
+		rcancel()
+		if err != nil {
+			c.logger.Error("nputurbo: failed to boost above-rated device(s)",
+				"ids", aboveIDs, "target_mhz", maxAbove, "error", err)
+		}
+	}
+	// 3. At-or-below-rated targets (ramp stage): pin each individually via
+	// native DVFS (no side effects on other devices).
+	for _, r := range belowRows {
+		if err := c.actuator.BoostAtOrBelow(r.ID, r.B); err != nil {
+			c.logger.Error("nputurbo: failed to pin device", "id", r.ID, "target_mhz", r.B, "error", err)
+		}
+	}
+	c.logger.Info(fmt.Sprintf("nputurbo: cycle done — restored all devices, boosted %d above-rated device(s), pinned %d at-or-below-rated device(s)",
+		len(aboveIDs), len(belowRows)))
+	c.emitMetrics(now, len(p.rows))
 }
 
 // plan is one control cycle's read-only computation (no actuation).
@@ -232,8 +205,8 @@ func (c *Controller) planBoosts() (plan, error) {
 	}
 	for _, sc := range cards {
 		// score<=1 in the list is equivalent to not being listed at all —
-		// for a previously-boosted device this is the recovery signal
-		// (clean), not a plan entry.
+		// the device is not slow; after the per-cycle restore it simply
+		// stays at rated.
 		if sc.Score <= 1.0 {
 			p.skipped = append(p.skipped, SkipRow{ID: sc.ID, Score: sc.Score,
 				Reason: fmt.Sprintf("score %.2f ≤ 1 (not slow, treated as not listed)", sc.Score)})
@@ -254,8 +227,8 @@ func (c *Controller) planBoosts() (plan, error) {
 		}
 		if f.Current > m {
 			// Current frequency already above the cap: never downclock, leave
-			// the device alone (also not a recovery signal — it is still
-			// slow).
+			// the device alone (the per-cycle restore resets it to rated, but
+			// it is never boosted above that).
 			c.logger.Warn(fmt.Sprintf("nputurbo: device %d current %d MHz is already above the boost cap %d MHz; left untouched", sc.ID, f.Current, m))
 			p.skipped = append(p.skipped, SkipRow{ID: sc.ID, Score: sc.Score,
 				Reason: fmt.Sprintf("current %d MHz is already above the boost cap %d MHz", f.Current, m)})
@@ -282,14 +255,15 @@ func (c *Controller) npuTurboTimeout() time.Duration {
 }
 
 // emitMetrics builds nputurbo.* state metrics, applies the catalog filter,
-// and writes them to storage for observability.
-func (c *Controller) emitMetrics(now time.Time) {
+// and writes them to storage for observability. boostedCount is the number
+// of devices boosted this cycle (the stateless model has no cross-tick
+// boosted set).
+func (c *Controller) emitMetrics(now time.Time, boostedCount int) {
 	if c.store == nil {
 		return
 	}
-	boosted := c.actuator.BoostedIDs()
 	active := 0.0
-	if len(boosted) > 0 {
+	if boostedCount > 0 {
 		active = 1
 	}
 	ok := 0.0
@@ -298,7 +272,7 @@ func (c *Controller) emitMetrics(now time.Time) {
 	}
 	ms := []collector.Metric{
 		{Component: "nputurbo", Name: "boost_active", Value: active, Unit: "", Timestamp: now},
-		{Component: "nputurbo", Name: "boost_count", Value: float64(len(boosted)), Unit: "", Timestamp: now},
+		{Component: "nputurbo", Name: "boost_count", Value: float64(boostedCount), Unit: "", Timestamp: now},
 		{Component: "nputurbo", Name: "actuator_ok", Value: ok, Unit: "", Timestamp: now},
 	}
 	filtered := metrics.Filter(ms)

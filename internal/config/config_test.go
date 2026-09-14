@@ -19,11 +19,8 @@ func TestDefaultNputurboConfig(t *testing.T) {
 	if !cfg.Nputurbo.RestoreOnShutdown {
 		t.Error("Nputurbo.RestoreOnShutdown should default true")
 	}
-	if cfg.Nputurbo.NpuTurboCmd != "/home/jw/npu_turbo_one.sh inject -d {id} -f {freq} -r {rated}" {
-		t.Errorf("Nputurbo.NpuTurboCmd = %q", cfg.Nputurbo.NpuTurboCmd)
-	}
-	if cfg.Nputurbo.NpuTurboCleanCmd != "/home/jw/npu_turbo_one.sh clean" {
-		t.Errorf("Nputurbo.NpuTurboCleanCmd = %q", cfg.Nputurbo.NpuTurboCleanCmd)
+	if cfg.Nputurbo.NpuTurboBin != "/home/jw/npu_turbo" {
+		t.Errorf("Nputurbo.NpuTurboBin = %q, want /home/jw/npu_turbo", cfg.Nputurbo.NpuTurboBin)
 	}
 	if cfg.Nputurbo.StragglerURL != "" {
 		t.Errorf("Nputurbo.StragglerURL = %q, want empty default", cfg.Nputurbo.StragglerURL)
