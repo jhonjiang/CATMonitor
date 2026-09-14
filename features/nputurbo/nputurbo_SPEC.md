@@ -22,6 +22,8 @@
 > ③ **注入顺序**——先**一起**调 B>额定 组（一次 `npu_turbo -f maxB` 全局抬频 + 逐个非目标降到各自额定）,再逐张调 B≤额定 组（原生钉频）;顺序不可换——批量降额会覆盖先做的钉频。
 >
 > **修订(2026-09-14 三次):** `npu_dvfs` 来源包由 `internal/source/` 移至 **`features/nputurbo/dvfs`**(包名缩短为 `dvfs`)——确认知其仅被 nputurbo 使用,特性内聚优先;`internal/source/` 保留通用来源层(npu_turbo 全局抬频仍在其中)。
+>
+> **修订(2026-09-14 四次)——npu_turbo CWD 修复:** 节点实测发现 `npu_turbo` 按**进程 CWD**(非二进制目录)解析 `lptest` 助手——从无 `lptest` 的目录运行时 `cp lptest lptestN` 失败、`lptestN turbocfg` 全部 exit 127(TDP 恢复不完整)。原包装脚本靠 `cd $(dirname $0)` 规避,原生集成时丢失了该保护,daemon(systemd CWD=/)会以同样方式失败。修复:`realRun` exec 时以二进制目录为 CWD(bare PATH 名除外);部署要求 `npu_turbo_bin` 绝对路径 + `lptest` 同目录。
 
 ## 1. 目标
 
@@ -116,6 +118,7 @@ nputurbo:
   straggler_url: "http://127.0.0.1:15432/straggler/result/latest"   # GET → profiler doc(顶层 kpi 块自动忽略)
   straggler_timeout: 10s                                    # HTTP GET 超时
   npu_turbo_bin: "/home/jw/npu_turbo"                        # 全局抬频二进制(exec: <bin> -f <MHz>),仅 B>额定 需要
+                                                               # 注意:必须绝对路径,且 lptest 助手与二进制同目录(见 §12)
   npu_turbo_timeout: 120s
   step_mhz: 50              # 取整步长
   dry_run: true             # 默认 judge+log;actuate 需 dry_run: false
@@ -168,6 +171,7 @@ CATMonitor nputurbo (read-only preview — no frequencies are changed)
 - 静态映射表只覆盖已知额定频率(当前仅 1800→1850);未映射额定 → 跳过不 boost。
 - straggler id 与 `snapshot_npu.json` 的对齐已适配全局 device id(`npu_id × chips_per_card + chip_id`,与 stragglerout 同公式);单芯片节点 device id == npu_id,行为不变。
 - **per-device DSMI 设 >额定 不被支持**(驱动限制,原 dvfs.py 作者即为此引入 npu_turbo 全局抬频);全局抬频仍依赖外部 `npu_turbo` 二进制(黑盒,路径 `npu_turbo_bin`)。若未来验证 per-device 可超额定(需真机实验),可去掉该依赖。
+- **npu_turbo 按进程 CWD 解析助手文件**(`lptest` 及其生成的 `lptest1..15`,工具用 `ls/cp/turbocfg` 相对路径操作它们)——与二进制所在目录无关。故 exec 时**强制以二进制目录为 CWD**(复刻原包装脚本的 `cd $(dirname $0)`;`npu_turbo.go realRun` 实现)。部署要求:`npu_turbo_bin` 用绝对路径且 `lptest` 与二进制同目录;手工运行时须先 cd 到该目录(否则 DSMI 部分成功、`lptestN turbocfg` 全部 exit 127,与 2026-09-14 节点实测一致)。
 - **主从 die 约束**(chip1 ≤ 同卡 chip0)由全局抬频天然满足;若改 per-device 方案需自行处理设置顺序。
 - **>额定批量假设组内 B 相同**:当前映射 {1800→1850} 恒成立(上限=额定+50);若未来映射条目差值 >50 步进,组内会出现不同 B,单次 `-f maxB` 会把低 B 目标抬过头,需重新设计(分组多次调用会互相破坏,已验证不可行)。
 - 每轮 CleanAll 是全局重置:稳定慢卡每轮经历额定→maxB 的秒级重建(接受);正常卡每轮被设回额定+重开 idle(其 DVFS 空闲降频立即恢复,无长期锁定)。

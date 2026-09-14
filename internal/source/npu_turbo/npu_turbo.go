@@ -5,12 +5,19 @@
 // the repo's exec-source pattern: singleton, runner seam. The runner returns
 // the command's combined stdout+stderr so callers can log what the tool
 // printed (the daemon surfaces npu_turbo output in journalctl).
+//
+// The tool resolves its helper files (lptest, and the per-card lptestN copies
+// it creates) relative to the process working directory, NOT the binary
+// location — the former wrapper script cd'd to its own directory for exactly
+// this reason. realRun therefore execs with the binary's directory as CWD;
+// use an absolute npu_turbo_bin path with lptest next to the binary.
 package npu_turbo
 
 import (
 	"context"
 	"fmt"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"sync"
 )
@@ -25,7 +32,16 @@ type Source interface {
 type runner = func(ctx context.Context, name string, args ...string) (string, error)
 
 func realRun(ctx context.Context, name string, args ...string) (string, error) {
-	out, err := exec.CommandContext(ctx, name, args...).CombinedOutput()
+	cmd := exec.CommandContext(ctx, name, args...)
+	// npu_turbo finds its helper files (lptest / lptestN) in the process CWD,
+	// not next to the binary. A systemd daemon's default CWD is "/", where no
+	// helpers exist — replicate the old wrapper script's
+	// `cd "$(dirname "$0")"` by running with the binary's directory as CWD.
+	// A bare command name on PATH (dir ".") keeps the caller's CWD.
+	if dir := filepath.Dir(name); dir != "." {
+		cmd.Dir = dir
+	}
+	out, err := cmd.CombinedOutput()
 	return string(out), err
 }
 
