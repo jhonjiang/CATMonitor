@@ -1151,3 +1151,13 @@ components:
         priority: High
         unit: ""
         static: false
+      - name: round_id
+        cn_name: "检测轮次"
+        priority: High
+        unit: ""
+        static: false
+      - name: result_age_seconds
+        cn_name: "检测结果年龄"
+        priority: High
+        unit: "s"
+        static: false

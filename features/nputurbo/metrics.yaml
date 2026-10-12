@@ -20,3 +20,7 @@ components:
         priority: High
       - name: actuator_ok
         priority: High
+      - name: round_id
+        priority: High
+      - name: result_age_seconds
+        priority: High

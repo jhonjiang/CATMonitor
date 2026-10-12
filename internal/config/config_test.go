@@ -28,4 +28,7 @@ func TestDefaultNputurboConfig(t *testing.T) {
 	if cfg.Nputurbo.StragglerTimeout != 10*time.Second {
 		t.Errorf("Nputurbo.StragglerTimeout = %v, want 10s", cfg.Nputurbo.StragglerTimeout)
 	}
+	if cfg.Nputurbo.StragglerMaxAge != 15*time.Minute {
+		t.Errorf("Nputurbo.StragglerMaxAge = %v, want 15m", cfg.Nputurbo.StragglerMaxAge)
+	}
 }

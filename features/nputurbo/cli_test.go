@@ -6,6 +6,7 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 )
 
 func newTestSnapshot(stragg StragglerSource, freqs FreqProvider) Snapshot {
@@ -113,5 +114,39 @@ func TestRunOnceSkippedDevicesListed(t *testing.T) {
 	out := FormatSnapshot(snap, cfg)
 	if !strings.Contains(out, "device 2") || !strings.Contains(out, "skipped — rated 2000 MHz is not in the boost cap map") {
 		t.Errorf("FormatSnapshot missing skipped row: %q", out)
+	}
+}
+
+func TestRunOnceShowsRoundInfo(t *testing.T) {
+	cfg := testConfig()
+	stragg := &fakeStraggler{payload: roundPayload(2, time.Now().Add(-5*time.Minute), 1, 1.4)}
+	snap := newTestSnapshot(stragg, testFreqs())
+	if snap.PlanErr != nil {
+		t.Fatalf("unexpected PlanErr: %v", snap.PlanErr)
+	}
+	if snap.RoundID != 2 || snap.RoundStarted.IsZero() || snap.RoundStale {
+		t.Errorf("round = (id %d, started %v, stale %v), want (2, set, false)", snap.RoundID, snap.RoundStarted, snap.RoundStale)
+	}
+	out := FormatSnapshot(snap, cfg)
+	if !strings.Contains(out, "straggler round") || !strings.Contains(out, "id 2") || !strings.Contains(out, "age") {
+		t.Errorf("FormatSnapshot missing round line: %q", out)
+	}
+}
+
+func TestRunOnceStaleWarning(t *testing.T) {
+	cfg := testConfig()
+	cfg.StragglerMaxAge = 5 * time.Minute
+	stragg := &fakeStraggler{payload: roundPayload(3, time.Now().Add(-time.Hour), 1, 1.4)}
+	act := newTestActuator(newFakeDVFS(0, 1), &fakeRaiser{})
+	snap := RunOnce(cfg, stragg, act, testFreqs())
+	if !snap.RoundStale {
+		t.Fatal("expected RoundStale")
+	}
+	if len(snap.Rows) != 0 {
+		t.Errorf("stale round must yield no rows, got %d", len(snap.Rows))
+	}
+	out := FormatSnapshot(snap, cfg)
+	if !strings.Contains(out, "stale") || !strings.Contains(out, "restore all devices to rated") {
+		t.Errorf("FormatSnapshot missing stale warning: %q", out)
 	}
 }

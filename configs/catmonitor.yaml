@@ -127,15 +127,20 @@ energysave:
 # unmapped ratings are never boosted. Frequency control is native (DSMI via
 # features/nputurbo/dvfs — no python, no scripts on the node); only the
 # above-rated global raise execs the external npu_turbo binary at
-# npu_turbo_bin. Stateless model: every cycle restores all devices to rated,
-# then boosts the fresh slow list (above-rated batch first, then per-device
-# ramp pins). dry_run true = judge+log only; set dry_run: false to actuate.
+# npu_turbo_bin. Round-deduplicated model: the result doc carries a round
+# id + started_at — a new round restores all devices to rated then boosts
+# the fresh slow list (above-rated batch first, then per-device ramp pins);
+# the same round fetched again triggers no actuation; a round older than
+# straggler_max_age (detector stopped updating) restores everything to
+# rated and boosts nothing (0 disables the check). dry_run true = judge+log
+# only; set dry_run: false to actuate.
 # See features/nputurbo/nputurbo_SPEC.md.
 nputurbo:
   enabled: false
   interval: 60s
   straggler_url: "http://127.0.0.1:15432/straggler/result/latest"   # GET → profiler doc (kpi block ignored)
   straggler_timeout: 10s                                    # HTTP GET timeout
+  straggler_max_age: 15m                                    # rounds older than this are stale → restore-only (0 disables)
   npu_turbo_bin: "/home/jw/npu_turbo"                        # above-rated global raise tool (exec: <bin> -f <MHz>)
   npu_turbo_timeout: 120s
   step_mhz: 50

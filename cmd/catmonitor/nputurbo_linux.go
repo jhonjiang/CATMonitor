@@ -8,9 +8,9 @@ import (
 	"log/slog"
 
 	"github.com/Computing-Availability-Tools/CATMonitor/features/nputurbo"
+	"github.com/Computing-Availability-Tools/CATMonitor/features/nputurbo/dvfs"
 	"github.com/Computing-Availability-Tools/CATMonitor/internal/collector"
 	"github.com/Computing-Availability-Tools/CATMonitor/internal/config"
-	"github.com/Computing-Availability-Tools/CATMonitor/features/nputurbo/dvfs"
 	"github.com/Computing-Availability-Tools/CATMonitor/internal/source/npu_turbo"
 	"github.com/Computing-Availability-Tools/CATMonitor/internal/source/straggler"
 )
@@ -25,6 +25,7 @@ func toNputurboConfig(cfg *config.Config, logger *slog.Logger) nputurbo.Config {
 		Interval:          cfg.Nputurbo.Interval,
 		StragglerURL:      cfg.Nputurbo.StragglerURL,
 		StragglerTimeout:  cfg.Nputurbo.StragglerTimeout,
+		StragglerMaxAge:   cfg.Nputurbo.StragglerMaxAge,
 		NpuTurboBin:       cfg.Nputurbo.NpuTurboBin,
 		NpuTurboTimeout:   cfg.Nputurbo.NpuTurboTimeout,
 		StepMhz:           cfg.Nputurbo.StepMhz,

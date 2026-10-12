@@ -2,7 +2,7 @@
 // straggler slow-node detector's result via HTTP GET. The endpoint URL is
 // supplied by the caller (controller's cfg.StragglerURL); this source is a
 // pure transport — it returns the response body and does not parse it
-// (parsing stays in features/nputurbo.ParseSlowCards). Mirrors the npu_smi
+// (parsing stays in features/nputurbo.ParseLatestRound). Mirrors the npu_smi
 // source pattern: singleton, fetcher seam for tests, graceful error return
 // on non-2xx / timeout / network failure.
 package straggler

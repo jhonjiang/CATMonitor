@@ -18,7 +18,8 @@ type Config struct {
 	Interval          time.Duration
 	StragglerURL      string
 	StragglerTimeout  time.Duration
-	NpuTurboBin       string // npu_turbo binary (global above-rated raise)
+	StragglerMaxAge   time.Duration // >0: rounds older than this are stale (restore-only); 0 disables the check
+	NpuTurboBin       string        // npu_turbo binary (global above-rated raise)
 	NpuTurboTimeout   time.Duration
 	StepMhz           int
 	DryRun            bool
@@ -34,19 +35,24 @@ type Storage interface {
 
 // StragglerSource is the seam for the straggler HTTP source (real =
 // straggler.Default(); tests inject a fake). Fetch returns the slow-card
-// detection result body; parsing stays in ParseSlowCards.
+// detection result body; parsing stays in ParseLatestRound.
 type StragglerSource interface {
 	Fetch(ctx context.Context, url string) ([]byte, error)
 }
 
-// Controller is the nputurbo control loop. Stateless model: each tick it
-// fetches the straggler slow-device result over HTTP, reads per-device
-// current + rated frequencies from the FreqProvider (snapshot_npu.json),
-// computes target freqs B = roundStep(min(A*score, M)) with A = aicore_freq
-// and M from the static rated→max table, then restores ALL devices to rated
-// and re-applies the boost set from the fresh list: above-rated targets in
-// one batch (global raise via the npu_turbo tool + lower the others), then
-// at-or-below-rated targets pinned individually. No cross-tick state.
+// Controller is the nputurbo control loop. Round-deduplicated model: each
+// tick it fetches the straggler slow-device result over HTTP, reads
+// per-device current + rated frequencies from the FreqProvider
+// (snapshot_npu.json), and computes target freqs B = roundStep(min(A*score,
+// M)) with A = aicore_freq and M from the static rated→max table. A NEW
+// round (identified by the (id, started_at) pair of the fetched doc) is
+// applied: restore ALL devices to rated, then the boost set — above-rated
+// targets in one batch (global raise via the npu_turbo tool + lower the
+// others), then at-or-below-rated targets pinned individually. A fetch
+// returning the very round that was fully applied last tick triggers no
+// actuation (the pins already hold on the hardware), and a round older
+// than straggler_max_age (detector stopped updating) restores everything
+// and boosts nothing.
 type Controller struct {
 	cfg      Config
 	stragg   StragglerSource
@@ -54,6 +60,13 @@ type Controller struct {
 	freqs    FreqProvider
 	store    Storage
 	logger   *slog.Logger
+
+	// lastKey is the dedupe identity of the last fully applied (or, under
+	// dry_run, fully reported) round. Only Run's loop and the tests call
+	// tick, from a single goroutine; the shutdown Restore path touches
+	// only the actuator — no locking needed.
+	lastKey roundKey
+	hasKey  bool
 }
 
 func NewController(cfg Config, stragg StragglerSource, actuator *Actuator, freqs FreqProvider, store Storage) *Controller {
@@ -97,17 +110,41 @@ func (c *Controller) Restore() {
 	}
 }
 
-// tick is exported for tests; it runs one control cycle. Stateless: restore
-// everything, then apply the fresh boost list (above-rated batch first, then
-// per-device pins — the order matters because the above-rated batch's
-// lower-others step would overwrite earlier per-device pins).
+// tick is exported for tests; it runs one control cycle. Round-deduplicated
+// model: a round identical to the last fully applied one triggers no
+// actuation; a new round restores everything, then applies the fresh boost
+// list (above-rated batch first, then per-device pins — the order matters
+// because the above-rated batch's lower-others step would overwrite earlier
+// per-device pins); a stale round (older than straggler_max_age) restores
+// everything and boosts nothing — the detector stopped updating, and
+// boosting on its last word forever is never right.
 func (c *Controller) tick(now time.Time) {
 	// planBoosts runs straggler + parse + per-device A/M lookup (no
 	// actuation). On failure it returns err → complete no-op: we have no
 	// fresh list to act on, so nothing is cleaned or boosted either.
-	p, err := c.planBoosts()
+	p, err := c.planBoosts(now)
 	if err != nil {
 		c.logger.Error("nputurbo: cannot build boost plan this cycle; no boost and no restore", "error", err)
+		return
+	}
+	if p.stale {
+		c.logger.Warn(fmt.Sprintf("nputurbo: straggler result is stale (round id %d started %s, age %s > straggler_max_age %s) — restoring all devices to rated, no boost",
+			p.round.ID, formatStartedAt(p.round.StartedAt), ageString(now, p.round.StartedAt), c.cfg.StragglerMaxAge))
+		if !c.cfg.DryRun {
+			if err := c.actuator.CleanAll(); err != nil {
+				c.logger.Error("nputurbo: stale-path restore failed; retrying next cycle", "error", err)
+			}
+		}
+		c.emitMetrics(now, p, 0)
+		return
+	}
+	// Round dedupe: this fetch returned the very round we fully applied
+	// (or fully reported, under dry_run) last time — nothing changed, so
+	// no actuation. The boost already sits on the hardware (pins hold).
+	if key, ok := p.round.Key(); ok && c.hasKey && key == c.lastKey {
+		c.logger.Info(fmt.Sprintf("nputurbo: straggler round unchanged (id %d started %s) — skipping actuation this cycle",
+			p.round.ID, formatStartedAt(p.round.StartedAt)))
+		c.emitMetrics(now, p, len(p.rows))
 		return
 	}
 	c.logger.Info(fmt.Sprintf("nputurbo: %d slow device(s) reported, %d to boost, %d skipped",
@@ -117,13 +154,16 @@ func (c *Controller) tick(now time.Time) {
 			c.logger.Info(fmt.Sprintf("nputurbo dry-run: would boost device %d from %d to %d MHz (score %.2f, rated %d, cap %d)",
 				r.ID, r.A, r.B, r.Score, r.Rated, r.M))
 		}
-		c.emitMetrics(now, len(p.rows))
+		c.recordRound(p)
+		c.emitMetrics(now, p, len(p.rows))
 		return
 	}
 	// 1. Restore every device to its own rated frequency. This resets any
 	// previous boost before the fresh list is applied, so recovered devices
 	// simply stay at rated. A failure is logged but does not stop the boosts.
+	var actErr error
 	if err := c.actuator.CleanAll(); err != nil {
+		actErr = err
 		c.logger.Error("nputurbo: failed to restore all devices to rated; continuing with boosts", "error", err)
 	}
 	// 2. Above-rated targets: one batch — global raise to maxB via the
@@ -149,6 +189,7 @@ func (c *Controller) tick(now time.Time) {
 		err := c.actuator.BoostAbove(rctx, aboveIDs, maxAbove)
 		rcancel()
 		if err != nil {
+			actErr = err
 			c.logger.Error("nputurbo: failed to boost above-rated device(s)",
 				"ids", aboveIDs, "target_mhz", maxAbove, "error", err)
 		}
@@ -157,53 +198,76 @@ func (c *Controller) tick(now time.Time) {
 	// native DVFS (no side effects on other devices).
 	for _, r := range belowRows {
 		if err := c.actuator.BoostAtOrBelow(r.ID, r.B); err != nil {
+			actErr = err
 			c.logger.Error("nputurbo: failed to pin device", "id", r.ID, "target_mhz", r.B, "error", err)
 		}
 	}
+	// Record the round only when every actuation step succeeded, so a
+	// partially applied round is retried on the next tick.
+	if actErr == nil {
+		c.recordRound(p)
+	}
 	c.logger.Info(fmt.Sprintf("nputurbo: cycle done — restored all devices, boosted %d above-rated device(s), pinned %d at-or-below-rated device(s)",
 		len(aboveIDs), len(belowRows)))
-	c.emitMetrics(now, len(p.rows))
+	c.emitMetrics(now, p, len(p.rows))
+}
+
+// recordRound remembers the plan's round as processed, enabling the
+// same-round skip on subsequent fetches (no-op for rounds without the
+// (id, started_at) identity — those are never deduped).
+func (c *Controller) recordRound(p plan) {
+	if key, ok := p.round.Key(); ok {
+		c.lastKey, c.hasKey = key, true
+	}
 }
 
 // plan is one control cycle's read-only computation (no actuation).
 type plan struct {
+	round   Round
+	stale   bool // round older than straggler_max_age → restore-only
 	cards   []SlowCard
 	rows    []BoostRow
 	skipped []SkipRow
 }
 
 // planBoosts runs straggler fetch + parse + per-device A/M lookup + compute
-// B. It does NOT actuate. A is the device's live aicore_freq from the
+// B. It does NOT actuate. The newest round is selected from the response
+// (ParseLatestRound); A is the device's live aicore_freq from the
 // FreqProvider (snapshot_npu.json); M is looked up from aicore_rated_freq via
 // the static rated→max table. A listed device lands in rows (with B) when
 // score>1 and its frequencies are processable; anything else is reported in
-// plan.skipped with a reason (score<=1 → treated as not listed; missing freq
-// data; unmapped rating; current above cap — never downclock). A slow-device
-// list with entries but an empty freq map is an error (caller no-ops the
-// whole tick — same philosophy as a straggler failure: no input, no
-// actuation). Shared by tick (which then actuates) and RunOnce (CLI preview,
-// which does not).
-func (c *Controller) planBoosts() (plan, error) {
+// plan.skipped with a reason (score≤1 → treated as not listed; missing freq
+// data; unmapped rating; current above cap — never downclock). A stale round
+// short-circuits with stale=true and no rows. A slow-device list with
+// entries but an empty freq map is an error (caller no-ops the whole tick —
+// same philosophy as a straggler failure: no input, no actuation). Shared by
+// tick (which then actuates) and RunOnce (CLI preview, which does not).
+func (c *Controller) planBoosts(now time.Time) (plan, error) {
 	sctx, scancel := context.WithTimeout(context.Background(), c.stragglerTimeout())
 	defer scancel()
 	data, ferr := c.stragg.Fetch(sctx, c.cfg.StragglerURL)
 	if ferr != nil {
 		return plan{}, fmt.Errorf("straggler fetch: %w", ferr)
 	}
-	cards, perr := ParseSlowCards(data)
+	round, perr := ParseLatestRound(data)
 	if perr != nil {
 		return plan{}, fmt.Errorf("parse: %w", perr)
 	}
 	var p plan
-	p.cards = cards
-	if len(cards) == 0 {
+	p.round = round
+	p.cards = round.Cards
+	if c.staleRound(now, round) {
+		p.stale = true
+		return p, nil // no rows — the tick restores-only
+	}
+	if len(round.Cards) == 0 {
 		return p, nil
 	}
 	freqs := c.freqs.DeviceFreqs()
 	if len(freqs) == 0 {
 		return plan{}, fmt.Errorf("no NPU freq data in snapshot (snapshot_npu.json missing/empty — check snapshot.enabled and the features scope)")
 	}
-	for _, sc := range cards {
+	for _, sc := range round.Cards {
 		// score<=1 in the list is equivalent to not being listed at all —
 		// the device is not slow; after the per-cycle restore it simply
 		// stays at rated.
@@ -254,11 +318,51 @@ func (c *Controller) npuTurboTimeout() time.Duration {
 	return 120 * time.Second
 }
 
+// staleRound reports whether the round is older than StragglerMaxAge — the
+// detector has stopped updating, so its last word must not be boosted on
+// forever. 0 disables the check; a round without started_at (old format)
+// can never be aged out.
+func (c *Controller) staleRound(now time.Time, r Round) bool {
+	if c.cfg.StragglerMaxAge <= 0 || r.StartedAt.IsZero() {
+		return false
+	}
+	return now.Sub(r.StartedAt) > c.cfg.StragglerMaxAge
+}
+
+// ageString renders a round's age for logs ("unknown" without started_at).
+func ageString(now, started time.Time) string {
+	if started.IsZero() {
+		return "unknown"
+	}
+	return now.Sub(started).Round(time.Second).String()
+}
+
+// formatStartedAt renders a round's started_at for logs ("unknown" when
+// absent).
+func formatStartedAt(t time.Time) string {
+	if t.IsZero() {
+		return "unknown"
+	}
+	return t.UTC().Format(time.RFC3339)
+}
+
+// roundAgeSeconds is the result_age_seconds metric: -1 when the round
+// carries no started_at (old format), clamped at 0 against clock skew.
+func roundAgeSeconds(now, started time.Time) float64 {
+	if started.IsZero() {
+		return -1
+	}
+	if d := now.Sub(started); d > 0 {
+		return d.Seconds()
+	}
+	return 0
+}
+
 // emitMetrics builds nputurbo.* state metrics, applies the catalog filter,
 // and writes them to storage for observability. boostedCount is the number
-// of devices boosted this cycle (the stateless model has no cross-tick
-// boosted set).
-func (c *Controller) emitMetrics(now time.Time, boostedCount int) {
+// of devices boosted this cycle (on a dedupe skip the pins still hold, so
+// the plan's row count remains the truth; a stale cycle reports 0).
+func (c *Controller) emitMetrics(now time.Time, p plan, boostedCount int) {
 	if c.store == nil {
 		return
 	}
@@ -274,6 +378,8 @@ func (c *Controller) emitMetrics(now time.Time, boostedCount int) {
 		{Component: "nputurbo", Name: "boost_active", Value: active, Unit: "", Timestamp: now},
 		{Component: "nputurbo", Name: "boost_count", Value: float64(boostedCount), Unit: "", Timestamp: now},
 		{Component: "nputurbo", Name: "actuator_ok", Value: ok, Unit: "", Timestamp: now},
+		{Component: "nputurbo", Name: "round_id", Value: float64(p.round.ID), Unit: "", Timestamp: now},
+		{Component: "nputurbo", Name: "result_age_seconds", Value: roundAgeSeconds(now, p.round.StartedAt), Unit: "s", Timestamp: now},
 	}
 	filtered := metrics.Filter(ms)
 	if len(filtered) > 0 {

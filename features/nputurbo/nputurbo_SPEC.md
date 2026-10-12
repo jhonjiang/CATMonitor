@@ -24,23 +24,27 @@
 > **修订(2026-09-14 三次):** `npu_dvfs` 来源包由 `internal/source/` 移至 **`features/nputurbo/dvfs`**(包名缩短为 `dvfs`)——确认知其仅被 nputurbo 使用,特性内聚优先;`internal/source/` 保留通用来源层(npu_turbo 全局抬频仍在其中)。
 >
 > **修订(2026-09-14 四次)——npu_turbo CWD 修复:** 节点实测发现 `npu_turbo` 按**进程 CWD**(非二进制目录)解析 `lptest` 助手——从无 `lptest` 的目录运行时 `cp lptest lptestN` 失败、`lptestN turbocfg` 全部 exit 127(TDP 恢复不完整)。原包装脚本靠 `cd $(dirname $0)` 规避,原生集成时丢失了该保护,daemon(systemd CWD=/)会以同样方式失败。修复:`realRun` exec 时以二进制目录为 CWD(bare PATH 名除外);部署要求 `npu_turbo_bin` 绝对路径 + `lptest` 同目录。
+>
+> **修订(2026-10-12)——轮次感知(去重 + 防过期):** straggler 结果 doc 顶层新增 `id`(检测轮次号,**检测器进程重启会从 1 重计**)与 `started_at`(该轮检测开始时间,RFC3339,**不随重启重置**)。① **选轮**——`ParseSlowCards` → `ParseLatestRound`:候选 doc 中带 `started_at` 者胜出,取最晚 `started_at`,平局取大 `id`(id 单独不可作序——重启重计,时间戳不会);全无 `started_at` 退化为取末行(旧格式行为)。② **跨 tick 去重**——轮次身份 = `(id, started_at)` 二元组(裸 id 会撞重启);与上次**完整成功**应用的轮次相同 → 本 tick 跳过全部 actuation(pin 在硬件上持续生效,省掉每 60s 的全设备 DSMI 写);actuation 任一步失败则不记录身份 → 下 tick 重试同轮次。③ **防过期**——最新轮次 `now - started_at > straggler_max_age`(新配置,默认 15m,0 关闭)→ 仅 `CleanAll` 恢复额定、不注入(修掉"检测器停更 → 永久 boost"隐患)。`id`/`started_at` 任一缺失 → 不选轮、不去重、不检查(旧格式 = 原"无状态每轮重置"行为,零影响)。新指标:`nputurbo.round_id`、`nputurbo.result_age_seconds`(缺 started_at 发 -1)。
 
 ## 1. 目标
 
-对慢卡(跑同一任务比正常卡慢,`score > 1.0`)升频。慢卡清单由**外部 straggler 检测器**产出:daemon 周期 HTTP GET `straggler_url` 拿检测结果(profiler doc);nputurbo 结合 `snapshot_npu.json` 里的实时/额定频率对每张慢卡算目标频率 B,然后**每轮先恢复所有设备到各自额定,再按新清单注入**——B>额定 的组一次批量全局抬频,B≤额定 的组逐张原生钉频。执行层为原生 DSMI 调用(`features/nputurbo/dvfs`,原 dvfs.py 语义)+ 唯一外部依赖 `npu_turbo` 二进制(全局抬频)。
+对慢卡(跑同一任务比正常卡慢,`score > 1.0`)升频。慢卡清单由**外部 straggler 检测器**产出:daemon 周期 HTTP GET `straggler_url` 拿检测结果(profiler doc,带轮次 `id`/`started_at`);nputurbo 结合 `snapshot_npu.json` 里的实时/额定频率对每张慢卡算目标频率 B,然后**每个新轮次先恢复所有设备到各自额定,再按新清单注入**——B>额定 的组一次批量全局抬频,B≤额定 的组逐张原生钉频;同轮次重复获取不重复注入,过期轮次仅恢复不注入。执行层为原生 DSMI 调用(`features/nputurbo/dvfs`,原 dvfs.py 语义)+ 唯一外部依赖 `npu_turbo` 二进制(全局抬频)。
 
 ## 2. 架构
 
 ```
 Controller.tick (interval):
   straggler.Fetch(straggler_url)              # HTTP GET → 响应体(profiler doc)
-     → ParseSlowCards(body)                    # 详见 §3、§4
-     → FreqProvider.DeviceFreqs()              # 读 snapshot_npu.json:
+     → ParseLatestRound(body)                 # 选最新轮次(§4):最晚 started_at,平局大 id
+     → [轮次过期?] age > straggler_max_age → 仅 CleanAll,不注入(§7)
+     → [轮次去重?] (id, started_at) == 上次完整应用 → 跳过全部 actuation(§7)
+     → FreqProvider.DeviceFreqs()             # 读 snapshot_npu.json:
                                                #   A = aicore_freq(每 device,全局 id 对齐)
                                                #   rated = aicore_rated_freq → 查 ratedMaxBoost 表 → M
      → ① CleanAll(原生 DSMI): 逐设备 关idle→设各自额定→开idle
      → ② B>额定 组: npu_turbo -f maxB(全局抬频,唯一 exec)
-                    + 逐个非目标 关idle→设各自额定→开idle
+                     + 逐个非目标 关idle→设各自额定→开idle
      → ③ B≤额定 组(爬坡): 逐张 关idle→设B(不重开 = 钉住)
    emitMetrics → sink(/metrics + snapshot_nputurbo.json + jsonl)
 ```
@@ -49,32 +53,35 @@ Controller.tick (interval):
 
 ## 3. 输入获取(straggler,HTTP)
 
-控制器每 tick:① HTTP GET `straggler_url`(带 `straggler_timeout`);② `ParseSlowCards` 解析响应体(§4)。响应体格式与原 straggler 输出一致(`profiler.node_result`;顶层 `kpi` 块由 `json.Unmarshal` 自动忽略,§4)。
+控制器每 tick:① HTTP GET `straggler_url`(带 `straggler_timeout`);② `ParseLatestRound` 解析响应体(§4)。响应体格式与原 straggler 输出一致(`profiler.node_result`;顶层 `kpi` 块由 `json.Unmarshal` 自动忽略,§4),新版本顶层多 `id`(轮次号)与 `started_at`(轮次开始时间)。
 
 - HTTP 失败(超时 / 非 2xx / 网络错 / DNS)→ 本周期**完全 no-op**(不调频、**不 clean**——拿不到清单无法对齐 desired state)。
 - 响应体为空 / 全行解析失败 → 完全 no-op。
 - 解析成功但 `node_result` 为空 list(无慢卡)→ **不 inject**,但按 §7 clean(所有曾 boost 的卡恢复)。
+- 选中轮次 `started_at` 距今 > `straggler_max_age`(0 关闭;doc 无 `started_at` 不检查)→ **仅 clean**(恢复全部到额定,不注入)——检测器停更后不能按其最后一词永久 boost。
 - `straggler_url` 为空 → nputurbo 不启动(与 `enabled:false` 同效,启动日志报错)。
 
 straggler 接口由 daemon HTTP GET 获取,与本仓库 `features/stragglerout/` 无关(后者是 KPI 输出,不影响本特性)。
 
 ## 4. 解析器(对 jsonl / 单 doc 都健壮)
 
-straggler 写法可能是"一行整份 profiler doc"或"整文件一整份 JSON(可能 pretty-print)"。解析器:① 先 `json.Unmarshal(整个文件)`,成功 → 用其 `profiler.node_result`;② 失败 → 按行 split,每非空行 `json.Unmarshal`,取**最后一行**成功解析的(最新检测结果);③ 零成功行 → 返回 error(调用方 no-op)。
+straggler 写法可能是"一行整份 profiler doc"或"整文件一整份 JSON(可能 pretty-print)"。解析器:① 先 `json.Unmarshal(整个文件)`,成功 → 即该轮;② 失败 → 按行 split,每非空行 `json.Unmarshal`,在**全部成功行中选最新轮次**(规则见下);③ 零成功行 → 返回 error(调用方 no-op)。
 
-数据结构(原嵌套,`npu` 为 list):
+**选轮规则**(`laterRound`):候选中带 `started_at` 的 doc 胜过不带的;带时间戳者取**最晚 `started_at`**,平局取**大 `id`**;全无 `started_at` 退化为取**末行**(旧格式追加序即最新)。`id` 单独不可作序——检测器进程重启后 id 从 1 重计,而 `started_at` 不会重置。
+
+数据结构(原嵌套,`npu` 为 list;顶层 `id`/`started_at` 为 2026-10 新增,缺失容忍):
 
 ```json
-{"profiler":{"node_result":[{"hostname":"work4","npu":[{"id":1,"cal":{"score":1.234}}]}],"comm_domain_result":{}}}
+{"id": 2, "started_at": "2026-10-09T08:57:15Z", "profiler": {"node_result": [{"hostname": "master", "npu": [{"id": 1, "cal": {"score": 1.3225}}]}], "comm_domain_result": {}}}
 ```
 
-展平:遍历 `node_result` 每 node → 遍历 `node.npu` 每卡 → `SlowCard{Hostname, ID, Score}`。hostname **不过滤**(全部纳入,假定文件为单节点或运行方按节点部署)。`id` = **全局 device id**(`npu_id × chips_per_card + chip_id`,即 stragglerout 喂给 straggler 检测器、检测器原样报回的编号),既用于 inject `-d <id>`,也用于与 `snapshot_npu.json` 对齐取 A/rated(见 §5)。
+展平:遍历 `node_result` 每 node → 遍历 `node.npu` 每卡 → `SlowCard{Hostname, ID, Score}`;连同 `id`/`started_at` 组成 `Round{ID, StartedAt, Cards}`。hostname **不过滤**(全部纳入,假定文件为单节点或运行方按节点部署)。`id` = **全局 device id**(`npu_id × chips_per_card + chip_id`,即 stragglerout 喂给 straggler 检测器、检测器原样报回的编号),既用于 inject `-d <id>`,也用于与 `snapshot_npu.json` 对齐取 A/rated(见 §5)。注意区分:顶层 `id` 是**检测轮次号**,`npu[].id` 才是 device id。
 
 ## 5. 公式
 
 `B = round_step(min(A × score, M), step=50)`(四舍五入到 50MHz,ties go up)。
 
-- **升频门槛:`score > 1`(唯一)。** score>1 且 A≤M → 计算 B 并注入(见 §7 无状态模型——每轮恢复全部后按清单重新注入,无幂等/记忆概念)。
+- **升频门槛:`score > 1`(唯一)。** score>1 且 A≤M → 计算 B 并注入(见 §7 轮次去重模型——同一轮次不重复应用,新轮次恢复全部后按清单重新注入)。
 - `A` = 该 device 实时 `aicore_freq`(MHz,从 `snapshot_npu.json` 读取,按**全局 device id** `npu_id × chips_per_card + chip_id` 对齐 straggler id;`chips_per_card` 由快照 `max(chip_id)+1` 推导:单芯片 1、A3 双芯片 2,单芯片节点 device id == npu_id)。**已知且接受的爬坡行为(2026-09-14 确认)**:闲置降频中的卡(如 A≈820)第一针 B = round50(A×score) 会低于额定(如 1150 < 1800),需 2-3 个周期才收敛到 M——首针可能短暂低于负载下的自然频率,不改(保留以实时频率为基数的语义,未改为按额定/直接封顶)。
 - `M` = 静态映射表 `ratedMaxBoost[rated]`,`rated` 为该卡 `aicore_rated_freq`。当前仅 `1800 → 1850`。**未映射的额定频率 → 该卡跳过不 boost**(无 fallback,不用配置兜底)。
 - **`A > M` → 不注入**(该卡每轮仍会被 CleanAll 恢复到额定,但不再往上加)。
@@ -92,18 +99,29 @@ actuator 持有两个执行源:**原生 DVFS**(`features/nputurbo/dvfs`,CGo+dlop
 
 npu_dvfs 的 DSMI 调用逐行对应 dvfs.py:关/开 idle = `dsmi_set_device_info(dev, main=8, sub=11, {idle_switch})`;设频 = `dsmi_set_device_info(dev, main=8, sub=12, {type=0(STRESS_ADJ_AIC), set_restore=2(STRESS_FREQ_SET), value})`;查额定 = `dsmi_get_device_frequency(dev, 9)`;枚举 = `dsmi_get_device_count` + `dsmi_list_device`。构建机无需 NPU 环境(运行时 dlopen),非 Linux/非 CGo 构建回退不可用 stub。
 
-## 7. 调频策略(无状态每轮重置)
+## 7. 调频策略(轮次去重 + 防过期)
 
-**无跨轮状态**(LastApplied/reconcile 已删除)。每 tick 有效 plan 后:
+跨轮状态只剩一个:**上次完整成功应用(或 dry_run 下完整报告)的轮次身份** `lastKey = (id, started_at)`(裸 id 会在检测器重启后撞车,二元组不会——新轮次 `started_at` 必然更新)。每 tick 有效 plan 后按分支:
 
-1. **`CleanAll`**——恢复**所有**设备到各自额定。这一步天然处理了一切"恢复"场景:score≤1/从清单消失的卡恢复完就停在额定,无需专门判定。clean 失败仅记日志,不阻断后续注入。
+| 情形 | 行为 |
+|---|---|
+| 新轮次(身份变化,含重启后同 id 不同 `started_at`) | 走 ①→②→③ 完整流程,全步成功后记录身份 |
+| 同身份重复获取(结果未更新) | **跳过全部 actuation**(仅日志+指标;pin 在硬件上持续生效) |
+| 同身份但上次任一步失败 | 身份未记录 → 本 tick **重试**同轮次(自愈) |
+| 轮次过期(`age > straggler_max_age`) | **仅 `CleanAll`** 恢复额定、不注入、不记录身份;每 tick 重复(自愈) |
+| doc 缺 `id` 或 `started_at`(旧格式) | 不去重不检查 → 每 tick 完整流程(原"无状态每轮重置"行为,零影响) |
+| plan 失败(拿不到/解析失败/快照空) | 整轮完全 no-op(不 clean 不注入:拿不到输入不动硬件) |
+
+完整流程(新轮次):
+
+1. **`CleanAll`**——恢复**所有**设备到各自额定。这一步天然处理了一切"恢复"场景:score≤1/从清单消失的卡恢复完就停在额定,无需专门判定。clean 失败仅记日志,不阻断后续注入(但计入"任一步失败",本轮次不记录身份 → 下 tick 重试)。
 2. **B>额定 组,一次批量**——`BoostAbove(组内全部 id, maxB)`。当前映射表 {1800→1850} 下组内所有 B 恒等于 M(上限与额定差 ≤ 一个步进,(1800,1850] 内 50 倍数只有 1850),单次抬频频率天然覆盖全组。**必须在钉频之前执行**——批量的"降其余到额定"会覆盖先做的钉频。
 3. **B≤额定 组(爬坡),逐张钉频**——`BoostAtOrBelow(id, B)`,原生调用无副作用、互不影响。
 
-- 清单为空 / 全部跳过 → 仅 CleanAll。
-- plan 失败(straggler 拿不到/解析失败/快照空)→ **整轮完全 no-op**(不 clean 不注入:拿不到输入不动硬件)。
+- 清单为空 / 全部跳过 → 仅 CleanAll(空清单轮次同样参与去重:同身份的空轮次不重复 clean)。
 - shutdown → `CleanAll()`;`restore_on_shutdown: false` 可关。
-- 稳态代价:稳定慢卡每轮经历一次 额定→maxB 的秒级重建(每轮固定 1 次 CleanAll + 1 次批量抬频 + k 次钉频调用;DSMI 原生调用为微秒级,主要耗时是 npu_turbo 一次 exec)。
+- 稳态代价:同轮次内零硬件写(去重);新轮次每轮经历一次 额定→maxB 的秒级重建(1 次 CleanAll + 1 次批量抬频 + k 次钉频调用;DSMI 原生调用为微秒级,主要耗时是 npu_turbo 一次 exec)。
+- 已知取舍:同轮次跳过期间,若有人手动改某设备频率,同轮次内不纠正(到下一轮次或过期才被 CleanAll 重置)——用去重换 DSMI 写次数减少的代价。
 
 ## 8. 配置
 
@@ -117,8 +135,9 @@ nputurbo:
   interval: 60s
   straggler_url: "http://127.0.0.1:15432/straggler/result/latest"   # GET → profiler doc(顶层 kpi 块自动忽略)
   straggler_timeout: 10s                                    # HTTP GET 超时
+  straggler_max_age: 15m                                    # 轮次过期阈值:age > 此值 → 仅恢复额定不注入;0 关闭(默认 15m)
   npu_turbo_bin: "/home/jw/npu_turbo"                        # 全局抬频二进制(exec: <bin> -f <MHz>),仅 B>额定 需要
-                                                               # 注意:必须绝对路径,且 lptest 助手与二进制同目录(见 §12)
+                                                                # 注意:必须绝对路径,且 lptest 助手与二进制同目录(见 §12)
   npu_turbo_timeout: 120s
   step_mhz: 50              # 取整步长
   dry_run: true             # 默认 judge+log;actuate 需 dry_run: false
@@ -131,7 +150,7 @@ nputurbo:
 
 ## 9. 指标(feature-scoped)
 
-`features/nputurbo/metrics.yaml` 声明 `nputurbo` 组件(`boost_active`/`boost_count`/`actuator_ok`,均 High)**及输入** `npu.aicore_freq`/`npu.aicore_rated_freq`(均 Medium;rated 在默认目录为 Low,feature yaml 提升为 Medium 使其在 `min_priority: medium` 下必采)。写 `sink` → 经 `PerCompWriter` 落 `snapshot_nputurbo.json`,经 `CachingStorage` 进 `/metrics`。`configs/metrics.yaml` 的 `nputurbo` 组件段手维护(`gen_metrics_catalog.py` 不覆盖特性产出指标)。
+`features/nputurbo/metrics.yaml` 声明 `nputurbo` 组件(`boost_active`/`boost_count`/`actuator_ok`/`round_id`/`result_age_seconds`,均 High;`round_id` = 选中轮次号,`result_age_seconds` = 结果年龄秒数,缺 `started_at` 发 -1)**及输入** `npu.aicore_freq`/`npu.aicore_rated_freq`(均 Medium;rated 在默认目录为 Low,feature yaml 提升为 Medium 使其在 `min_priority: medium` 下必采)。写 `sink` → 经 `PerCompWriter` 落 `snapshot_nputurbo.json`,经 `CachingStorage` 进 `/metrics`。`configs/metrics.yaml` 的 `nputurbo` 组件段手维护(`gen_metrics_catalog.py` 不覆盖特性产出指标)。
 
 ## 10. CLI
 
@@ -142,23 +161,24 @@ CATMonitor nputurbo (read-only preview — no frequencies are changed)
   actuator available: true
   npu_turbo binary:   true
   boost caps:         rated 1800 MHz → max 1850 MHz  (step 50 MHz)
+  straggler round:   id 2, started 2026-10-09T08:57:15Z (age 5m10s)
   device 1: current 1800 MHz → target 1850 MHz  (score 1.10, rated 1800, cap 1850)
   device 2: skipped — rated 2000 MHz is not in the boost cap map
 ```
 
-**强制 dry-run 不碰硬件**(镜像 energysave CLI)。actuate 走 daemon `enabled: true` + `dry_run: false`。
+轮次行仅在新格式(有 `id`/`started_at`)时出现;过期时追加 WARNING 行(`the daemon would restore all devices to rated and boost nothing`)。**强制 dry-run 不碰硬件**(镜像 energysave CLI)。actuate 走 daemon `enabled: true` + `dry_run: false`。
 
 ## 11. 测试
 
 - `internal/source/straggler/`:fetcher seam 注入假响应,验证 fetch 超时/错误传播。
 - `features/nputurbo/dvfs/`:只读冒烟(Available/DeviceIDs/RatedFreq,skip 守卫);**测试绝不调用写操作**(SetAicFreq/CloseIdle/OpenIdle 会动真机硬件)。
 - `internal/source/npu_turbo/`:RaiseAll 参数拼接(`<bin> -f <MHz>`)、错误与输出透传。
-- `features/nputurbo/input_test.go`:jsonl fixture 覆盖——单行整 doc、pretty-print 整 doc、多行追加(取末行)、`node_result` 空、多 node 多卡、坏行跳过、全坏返回 error。
+- `features/nputurbo/input_test.go`:jsonl fixture 覆盖——单行整 doc、pretty-print 整 doc、多行追加、`node_result` 空、多 node 多卡、坏行跳过、全坏返回 error;**轮次元数据**——带 `id`/`started_at` 的 doc 解析、按最晚 `started_at` 选轮、重启场景(同 `id` 不同 `started_at`)、乱序追加(旧大 id 在前新小 id 在后,新 `started_at` 胜)、同 `started_at` 平局取大 id、旧格式(无元数据)回退末行。
 - `features/nputurbo/freq_test.go`:映射表查找(1800→1850 命中/未映射 miss)、`SnapshotFreqProvider` 从 snapshot fixture 提取(单芯片 device id==npu_id / A3 双芯片全局 id `npu×2+chip` 每 chip 独立条目 / 缺 rated / 缺 chip_id 回退 npu_id / 缺文件空 map)。
 - `features/nputurbo/formula_test.go`:边界(`A×score>M` 截断、取整 50 边界、`score≤1` 跳过、`A>M` 不操作、A=M 封顶)。
 - `features/nputurbo/actuator_test.go`(fakeDVFS/fakeRaiser):CleanAll 用**各自额定**(混布 1800/2000)、单设备失败隔离;BoostAbove 先抬频后降非目标、目标不被 dvfs 触碰、抬频失败中止;BoostAtOrBelow 钉住(不重开 idle);Available/TurboAvailable。
-- `features/nputurbo/controller_test.go`:clean→批量→钉频**顺序**断言、多卡>额定单次批量、空清单仅 clean、全部跳过仅 clean、score≤1/A>M/缺频率数据不注入、straggler 失败/空 freqs 整轮 no-op、clean 失败仍注入、dry_run 零硬件调用。
-- `features/nputurbo/cli_test.go`:`RunOnce` 强制 dry-run、空清单、straggler 失败报错、skipped 展示、npu_turbo binary 行。
+- `features/nputurbo/controller_test.go`:clean→批量→钉频**顺序**断言、多卡>额定单次批量、空清单仅 clean、全部跳过仅 clean、score≤1/A>M/缺频率数据不注入、straggler 失败/空 freqs 整轮 no-op、clean 失败仍注入、dry_run 零硬件调用;**轮次语义**——同身份二次 tick 零硬件调用、新轮次(含重启同 id 新 `started_at`)重新执行、actuation 失败后同身份重试、过期仅 CleanAll(`straggler_max_age`=0 关闭、缺 `started_at` 不检查)、去重跳过仍发指标。
+- `features/nputurbo/cli_test.go`:`RunOnce` 强制 dry-run、空清单、straggler 失败报错、skipped 展示、npu_turbo binary 行、轮次行/过期 WARNING 展示。
 - 平台签名同步:`GOOS=windows go build ./cmd/catmonitor`(npu_dvfs stub 路径)。
 - 运行:`make lint && make test`(无 NPU/GPU 环境 mock + 优雅降级,项目既有约定)。
 

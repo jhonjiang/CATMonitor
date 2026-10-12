@@ -6,16 +6,17 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"time"
 )
 
 // BoostRow is one device's computed boost plan (no actuation).
 type BoostRow struct {
-	ID     int
-	A      int // current aicore_freq from snapshot (MHz)
-	Rated  int // rated aicore_freq from snapshot (MHz)
-	M      int // boost cap from the rated→max static map (MHz)
-	B      int // target freq (MHz, =round50(min(A*score,M)))
-	Score  float64
+	ID    int
+	A     int // current aicore_freq from snapshot (MHz)
+	Rated int // rated aicore_freq from snapshot (MHz)
+	M     int // boost cap from the rated→max static map (MHz)
+	B     int // target freq (MHz, =round50(min(A*score,M)))
+	Score float64
 }
 
 // SkipRow is a listed device excluded from the plan and why (its score is
@@ -28,12 +29,15 @@ type SkipRow struct {
 
 // Snapshot is the read-only plan returned by RunOnce for the CLI preview.
 type Snapshot struct {
-	Rows       []BoostRow
-	Skipped    []SkipRow
-	DryRun     bool
-	ActuatorOK bool // native DVFS library available
-	TurboOK    bool // npu_turbo binary found (above-rated boost available)
-	PlanErr    error
+	Rows         []BoostRow
+	Skipped      []SkipRow
+	RoundID      int       // straggler round id (0 = absent, old format)
+	RoundStarted time.Time // round started_at (zero = absent)
+	RoundStale   bool      // round older than straggler_max_age → the daemon would restore-only
+	DryRun       bool
+	ActuatorOK   bool // native DVFS library available
+	TurboOK      bool // npu_turbo binary found (above-rated boost available)
+	PlanErr      error
 }
 
 // RunOnce is the `catmonitor nputurbo` one-shot: run straggler once, parse,
@@ -43,14 +47,17 @@ type Snapshot struct {
 func RunOnce(cfg Config, stragg StragglerSource, actuator *Actuator, freqs FreqProvider) Snapshot {
 	cfg.DryRun = true
 	c := NewController(cfg, stragg, actuator, freqs, nil)
-	p, err := c.planBoosts()
+	p, err := c.planBoosts(time.Now())
 	return Snapshot{
-		Rows:       p.rows,
-		Skipped:    p.skipped,
-		DryRun:     true,
-		ActuatorOK: actuator.Available(),
-		TurboOK:    actuator.TurboAvailable(),
-		PlanErr:    err,
+		Rows:         p.rows,
+		Skipped:      p.skipped,
+		RoundID:      p.round.ID,
+		RoundStarted: p.round.StartedAt,
+		RoundStale:   p.stale,
+		DryRun:       true,
+		ActuatorOK:   actuator.Available(),
+		TurboOK:      actuator.TurboAvailable(),
+		PlanErr:      err,
 	}
 }
 
@@ -62,11 +69,19 @@ func FormatSnapshot(s Snapshot, cfg Config) string {
 	fmt.Fprintf(&b, "  actuator available: %v\n", s.ActuatorOK)
 	fmt.Fprintf(&b, "  npu_turbo binary:   %v\n", s.TurboOK)
 	fmt.Fprintf(&b, "  boost caps:         %s  (step %d MHz)\n", formatRatedMaxBoost(), cfg.StepMhz)
+	if s.RoundID > 0 || !s.RoundStarted.IsZero() {
+		fmt.Fprintf(&b, "  straggler round:   id %d, started %s (age %s)\n",
+			s.RoundID, formatStartedAt(s.RoundStarted), ageString(time.Now(), s.RoundStarted))
+	}
+	if s.RoundStale {
+		fmt.Fprintf(&b, "  WARNING: stale result (age %s > straggler_max_age %s) — the daemon would restore all devices to rated and boost nothing\n",
+			ageString(time.Now(), s.RoundStarted), cfg.StragglerMaxAge)
+	}
 	if s.PlanErr != nil {
 		fmt.Fprintf(&b, "  plan error:         %v\n", s.PlanErr)
 		return b.String()
 	}
-	if len(s.Rows) == 0 && len(s.Skipped) == 0 {
+	if len(s.Rows) == 0 && len(s.Skipped) == 0 && !s.RoundStale {
 		fmt.Fprintln(&b, "  (no slow devices reported)")
 		return b.String()
 	}
