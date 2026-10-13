@@ -26,6 +26,8 @@
 > **修订(2026-09-14 四次)——npu_turbo CWD 修复:** 节点实测发现 `npu_turbo` 按**进程 CWD**(非二进制目录)解析 `lptest` 助手——从无 `lptest` 的目录运行时 `cp lptest lptestN` 失败、`lptestN turbocfg` 全部 exit 127(TDP 恢复不完整)。原包装脚本靠 `cd $(dirname $0)` 规避,原生集成时丢失了该保护,daemon(systemd CWD=/)会以同样方式失败。修复:`realRun` exec 时以二进制目录为 CWD(bare PATH 名除外);部署要求 `npu_turbo_bin` 绝对路径 + `lptest` 同目录。
 >
 > **修订(2026-10-12)——轮次感知(去重 + 防过期):** straggler 结果 doc 顶层新增 `id`(检测轮次号,**检测器进程重启会从 1 重计**)与 `started_at`(该轮检测开始时间,RFC3339,**不随重启重置**)。① **选轮**——`ParseSlowCards` → `ParseLatestRound`:候选 doc 中带 `started_at` 者胜出,取最晚 `started_at`,平局取大 `id`(id 单独不可作序——重启重计,时间戳不会);全无 `started_at` 退化为取末行(旧格式行为)。② **跨 tick 去重**——轮次身份 = `(id, started_at)` 二元组(裸 id 会撞重启);与上次**完整成功**应用的轮次相同 → 本 tick 跳过全部 actuation(pin 在硬件上持续生效,省掉每 60s 的全设备 DSMI 写);actuation 任一步失败则不记录身份 → 下 tick 重试同轮次。③ **防过期**——最新轮次 `now - started_at > straggler_max_age`(新配置,默认 15m,YAML 里写 `0s` 关闭——duration 字段不接受裸 `0`,会解析报错)→ 仅 `CleanAll` 恢复额定、不注入(修掉"检测器停更 → 永久 boost"隐患)。`id`/`started_at` 任一缺失 → 不选轮、不去重、不检查(旧格式 = 原"无状态每轮重置"行为,零影响)。新指标:`nputurbo.round_id`、`nputurbo.result_age_seconds`(缺 started_at 发 -1)。
+>
+> **修订(2026-10-13)——稳态 no-op 跳过 + 列内超上限守卫修正:** ① **no-op 检测**——新轮次的计划行集合(设备→目标 B)与上次完整应用的相同,且每行 `A ≥ B`(快照实时验证;**用 ≥ 而非 ==**,因 npu_turbo 落频 1854~1879,精确等值对已 boost 卡永不成立)→ 本 tick 跳过全部 actuation——稳态慢卡(已 boost 到上限、清单不变)零硬件操作,不再每轮经历"额定→maxB 的秒级重建"。**行集合相等是必要条件**:恢复的卡(离开清单)、新列卡(即使 A==B 也要钉频关 idle)、目标变化的卡都必须走全套;首轮空清单仍 clean(`hasRows` 守卫),连续空清单轮次跳过。② **A>M 守卫移除**——原"current above cap → left untouched"对列内卡是错的:npu_turbo 落频 1854~1879 > 标称 1850,已 boost 的忙碌卡下一轮必触发守卫被排除出目标集,随后被批量的"降其余"步骤打回额定(仍慢却失 boost,稳态逐轮 1854→1800→1854 震荡)。修正:列内卡 `A ≥ M → B=M`(封顶逻辑天然给出);"永不降频"对列内卡本就是幻觉(CleanAll 每轮都会把它恢复到额定,管理到 1854 反而更接近意图)。
 
 ## 1. 目标
 
@@ -39,6 +41,7 @@ Controller.tick (interval):
      → ParseLatestRound(body)                 # 选最新轮次(§4):最晚 started_at,平局大 id
      → [轮次过期?] age > straggler_max_age → 仅 CleanAll,不注入(§7)
      → [轮次去重?] (id, started_at) == 上次完整应用 → 跳过全部 actuation(§7)
+     → [no-op?] 行集合 == 上次完整应用 且 每行 A≥B → 跳过全部 actuation(§7)
      → FreqProvider.DeviceFreqs()             # 读 snapshot_npu.json:
                                                #   A = aicore_freq(每 device,全局 id 对齐)
                                                #   rated = aicore_rated_freq → 查 ratedMaxBoost 表 → M
@@ -84,7 +87,7 @@ straggler 写法可能是"一行整份 profiler doc"或"整文件一整份 JSON(
 - **升频门槛:`score > 1`(唯一)。** score>1 且 A≤M → 计算 B 并注入(见 §7 轮次去重模型——同一轮次不重复应用,新轮次恢复全部后按清单重新注入)。
 - `A` = 该 device 实时 `aicore_freq`(MHz,从 `snapshot_npu.json` 读取,按**全局 device id** `npu_id × chips_per_card + chip_id` 对齐 straggler id;`chips_per_card` 由快照 `max(chip_id)+1` 推导:单芯片 1、A3 双芯片 2,单芯片节点 device id == npu_id)。**已知且接受的爬坡行为(2026-09-14 确认)**:闲置降频中的卡(如 A≈820)第一针 B = round50(A×score) 会低于额定(如 1150 < 1800),需 2-3 个周期才收敛到 M——首针可能短暂低于负载下的自然频率,不改(保留以实时频率为基数的语义,未改为按额定/直接封顶)。
 - `M` = 静态映射表 `ratedMaxBoost[rated]`,`rated` 为该卡 `aicore_rated_freq`。当前仅 `1800 → 1850`。**未映射的额定频率 → 该卡跳过不 boost**(无 fallback,不用配置兜底)。
-- **`A > M` → 不注入**(该卡每轮仍会被 CleanAll 恢复到额定,但不再往上加)。
+- **`A ≥ M` → B = M(列内卡按上限管理,不跳过)**。npu_turbo 落频 1854~1879 超过标称 1850,若把已 boost 的列内卡排除出目标集,批量的"降其余"步骤会把它打回额定(仍慢却失 boost);"永不降频"对列内卡本就是幻觉——CleanAll 每轮都会先把它恢复到额定,管理到 1854 反而更接近意图。
 - `step_mhz` = 50(配置)。
 
 ## 6. 执行器(actuator,原生集成)
@@ -99,29 +102,32 @@ actuator 持有两个执行源:**原生 DVFS**(`features/nputurbo/dvfs`,CGo+dlop
 
 npu_dvfs 的 DSMI 调用逐行对应 dvfs.py:关/开 idle = `dsmi_set_device_info(dev, main=8, sub=11, {idle_switch})`;设频 = `dsmi_set_device_info(dev, main=8, sub=12, {type=0(STRESS_ADJ_AIC), set_restore=2(STRESS_FREQ_SET), value})`;查额定 = `dsmi_get_device_frequency(dev, 9)`;枚举 = `dsmi_get_device_count` + `dsmi_list_device`。构建机无需 NPU 环境(运行时 dlopen),非 Linux/非 CGo 构建回退不可用 stub。
 
-## 7. 调频策略(轮次去重 + 防过期)
+## 7. 调频策略(轮次去重 + no-op 跳过 + 防过期)
 
-跨轮状态只剩一个:**上次完整成功应用(或 dry_run 下完整报告)的轮次身份** `lastKey = (id, started_at)`(裸 id 会在检测器重启后撞车,二元组不会——新轮次 `started_at` 必然更新)。每 tick 有效 plan 后按分支:
+跨轮状态只有两个:**上次完整成功应用(或 dry_run 下完整报告)的轮次身份** `lastKey = (id, started_at)`(裸 id 会在检测器重启后撞车,二元组不会——新轮次 `started_at` 必然更新)与**上次完整应用的计划行集合** `lastRows`(设备→目标 B)。每 tick 有效 plan 后按分支:
 
 | 情形 | 行为 |
 |---|---|
-| 新轮次(身份变化,含重启后同 id 不同 `started_at`) | 走 ①→②→③ 完整流程,全步成功后记录身份 |
-| 同身份重复获取(结果未更新) | **跳过全部 actuation**(仅日志+指标;pin 在硬件上持续生效) |
-| 同身份但上次任一步失败 | 身份未记录 → 本 tick **重试**同轮次(自愈) |
-| 轮次过期(`age > straggler_max_age`) | **仅 `CleanAll`** 恢复额定、不注入、不记录身份;每 tick 重复(自愈) |
-| doc 缺 `id` 或 `started_at`(旧格式) | 不去重不检查 → 每 tick 完整流程(原"无状态每轮重置"行为,零影响) |
+| 新轮次、行集合与上次相同 且 每行 A≥B(**no-op 跳过**) | **跳过全部 actuation**——稳态慢卡零硬件操作(仅日志+指标;pin/抬频在硬件上持续生效) |
+| 同身份重复获取(结果未更新) | 跳过全部 actuation(同上) |
+| 新轮次、行集合变化(恢复/新增/目标变)或某行 A<B | 走 ①→②→③ 完整流程,全步成功后记录身份+行集合;目标卡经受一次 ~18s 回落(CleanAll 先恢复额定再重抬) |
+| 同身份但上次任一步失败 | 身份/行集合未记录 → 本 tick **重试**同轮次(自愈) |
+| 轮次过期(`age > straggler_max_age`) | **仅 `CleanAll`** 恢复额定、不注入、不记录;每 tick 重复(自愈) |
+| doc 缺 `id` 或 `started_at`(旧格式) | 不去重不做 no-op 不检查 → 每 tick 完整流程(原"无状态每轮重置"行为,零影响) |
 | plan 失败(拿不到/解析失败/快照空) | 整轮完全 no-op(不 clean 不注入:拿不到输入不动硬件) |
 
-完整流程(新轮次):
+**no-op 跳过的条件细节**(`sameTargets`):行集合相等是必要条件——恢复的卡(离开清单)必须走全套(其 CleanAll 是恢复机制),新列卡即使 A==B 也要钉频关 idle(否则下一轮闲置回落触发锯齿);`A ≥ B` 用 ≥ 而非 ==(npu_turbo 落频 1854~1879,精确等值对已 boost 卡永不成立);`lastRows` 永不清空——过期引用(如 stale 恢复后)由 A≥B 实时验证自愈;首轮空清单仍 clean(`hasRows` 守卫:防止 nil 行集合匹配空计划),连续空清单轮次跳过(稳态无慢卡零操作)。
+
+完整流程(行集合变化的新轮次):
 
 1. **`CleanAll`**——恢复**所有**设备到各自额定。这一步天然处理了一切"恢复"场景:score≤1/从清单消失的卡恢复完就停在额定,无需专门判定。clean 失败仅记日志,不阻断后续注入(但计入"任一步失败",本轮次不记录身份 → 下 tick 重试)。
 2. **B>额定 组,一次批量**——`BoostAbove(组内全部 id, maxB)`。当前映射表 {1800→1850} 下组内所有 B 恒等于 M(上限与额定差 ≤ 一个步进,(1800,1850] 内 50 倍数只有 1850),单次抬频频率天然覆盖全组。**必须在钉频之前执行**——批量的"降其余到额定"会覆盖先做的钉频。
 3. **B≤额定 组(爬坡),逐张钉频**——`BoostAtOrBelow(id, B)`,原生调用无副作用、互不影响。
 
-- 清单为空 / 全部跳过 → 仅 CleanAll(空清单轮次同样参与去重:同身份的空轮次不重复 clean)。
+- 清单为空 / 全部跳过 → 走 no-op 分支(首轮空清单 clean 一次,后续连续空清单轮次跳过)。
 - shutdown → `CleanAll()`;`restore_on_shutdown: false` 可关。
-- 稳态代价:同轮次内零硬件写(去重);新轮次每轮经历一次 额定→maxB 的秒级重建(1 次 CleanAll + 1 次批量抬频 + k 次钉频调用;DSMI 原生调用为微秒级,主要耗时是 npu_turbo 一次 exec)。
-- 已知取舍:同轮次跳过期间,若有人手动改某设备频率,同轮次内不纠正(到下一轮次或过期才被 CleanAll 重置)——用去重换 DSMI 写次数减少的代价。
+- 稳态代价:**同轮次内零硬件写(去重);清单不变的稳态慢卡零硬件写(no-op 跳过)**——原"每轮固定 1 次 CleanAll + 1 次批量抬频 + k 次钉频"仅在清单/目标变化或某卡 A<B(漂移)时发生;变化轮的目标卡经受一次 ~18s 回落(CleanAll 先恢复额定,npu_turbo exec ~18s 后重抬)。
+- 已知取舍:同轮次/no-op 跳过期间,若有人手动改某设备频率,下次 actuation 前不纠正(到清单/目标变化或过期才被 CleanAll 重置)——用零硬件写换 DSMI churn 减少的代价。
 
 ## 8. 配置
 
@@ -144,7 +150,7 @@ nputurbo:
   restore_on_shutdown: true
 ```
 
-频率控制为原生 DSMI,无脚本/python/命令模板配置;`npu_turbo_cmd`/`npu_turbo_clean_cmd` 已删除(旧 YAML 残留被 yaml.v3 忽略,无害)。M 不在配置里——来自静态映射表 `ratedMaxBoost`(代码内,加条目改代码),只用于 B 封顶与 `A>M` 跳过判定。启用前置:`snapshot.enabled: true`(A/rated 都从 `snapshot_npu.json` 读)+ 节点有 Ascend driver(`libdrvdsmi_host.so`)+ `npu_turbo_bin` 就位(仅 B>额定 需要)。建议把 `nputurbo` 加入 `features:` 列表,使其 `metrics.yaml` 把 `npu.aicore_freq`/`npu.aicore_rated_freq`(输入)与 `nputurbo` 组件指标(输出)带入采集范围——features=[nputurbo] 单独成立时特性域自足。
+频率控制为原生 DSMI,无脚本/python/命令模板配置;`npu_turbo_cmd`/`npu_turbo_clean_cmd` 已删除(旧 YAML 残留被 yaml.v3 忽略,无害)。M 不在配置里——来自静态映射表 `ratedMaxBoost`(代码内,加条目改代码),只用于 B 封顶(含 A≥M → B=M 的上限管理)。启用前置:`snapshot.enabled: true`(A/rated 都从 `snapshot_npu.json` 读)+ 节点有 Ascend driver(`libdrvdsmi_host.so`)+ `npu_turbo_bin` 就位(仅 B>额定 需要)。建议把 `nputurbo` 加入 `features:` 列表,使其 `metrics.yaml` 把 `npu.aicore_freq`/`npu.aicore_rated_freq`(输入)与 `nputurbo` 组件指标(输出)带入采集范围——features=[nputurbo] 单独成立时特性域自足。
 
 **频率缺失行为**:单卡在快照中无 `aicore_freq`/`aicore_rated_freq` → 跳过该卡 + warn(每轮仍会被 CleanAll 恢复);整个 `snapshot_npu.json` 不可读(freqs map 为空)且清单非空 → 本周期完全 no-op(不 clean 不注入,拿不到输入不动硬件)。
 
@@ -175,9 +181,9 @@ CATMonitor nputurbo (read-only preview — no frequencies are changed)
 - `internal/source/npu_turbo/`:RaiseAll 参数拼接(`<bin> -f <MHz>`)、错误与输出透传。
 - `features/nputurbo/input_test.go`:jsonl fixture 覆盖——单行整 doc、pretty-print 整 doc、多行追加、`node_result` 空、多 node 多卡、坏行跳过、全坏返回 error;**轮次元数据**——带 `id`/`started_at` 的 doc 解析、按最晚 `started_at` 选轮、重启场景(同 `id` 不同 `started_at`)、乱序追加(旧大 id 在前新小 id 在后,新 `started_at` 胜)、同 `started_at` 平局取大 id、旧格式(无元数据)回退末行。
 - `features/nputurbo/freq_test.go`:映射表查找(1800→1850 命中/未映射 miss)、`SnapshotFreqProvider` 从 snapshot fixture 提取(单芯片 device id==npu_id / A3 双芯片全局 id `npu×2+chip` 每 chip 独立条目 / 缺 rated / 缺 chip_id 回退 npu_id / 缺文件空 map)。
-- `features/nputurbo/formula_test.go`:边界(`A×score>M` 截断、取整 50 边界、`score≤1` 跳过、`A>M` 不操作、A=M 封顶)。
+- `features/nputurbo/formula_test.go`:边界(`A×score>M` 截断、取整 50 边界、`score≤1` 跳过、`A>M` 管理到上限(1850)、A=M 封顶、工具落频超调 1879 → 1850)。
 - `features/nputurbo/actuator_test.go`(fakeDVFS/fakeRaiser):CleanAll 用**各自额定**(混布 1800/2000)、单设备失败隔离;BoostAbove 先抬频后降非目标、目标不被 dvfs 触碰、抬频失败中止;BoostAtOrBelow 钉住(不重开 idle);Available/TurboAvailable。
-- `features/nputurbo/controller_test.go`:clean→批量→钉频**顺序**断言、多卡>额定单次批量、空清单仅 clean、全部跳过仅 clean、score≤1/A>M/缺频率数据不注入、straggler 失败/空 freqs 整轮 no-op、clean 失败仍注入、dry_run 零硬件调用;**轮次语义**——同身份二次 tick 零硬件调用、新轮次(含重启同 id 新 `started_at`)重新执行、actuation 失败后同身份重试、过期仅 CleanAll(`straggler_max_age`=0s 关闭、缺 `started_at` 不检查)、去重跳过仍发指标。
+- `features/nputurbo/controller_test.go`:clean→批量→钉频**顺序**断言、多卡>额定单次批量、空清单仅 clean、全部跳过仅 clean、score≤1/缺频率数据不注入、straggler 失败/空 freqs 整轮 no-op、clean 失败仍注入、dry_run 零硬件调用、**列内超上限卡被管理到上限**(A=1900 → 抬到 1850,目标不被降);**轮次语义**——同身份二次 tick 零硬件调用、新轮次(含重启同 id 新 `started_at`)重新执行、actuation 失败后同身份重试、过期仅 CleanAll(`straggler_max_age`=0s 关闭、缺 `started_at` 不检查)、去重跳过仍发指标;**no-op 语义**——稳态轮(行集合同+全部 A≥B)零硬件调用、新慢卡加入走全套且既有目标不被降、恢复卡走全套被恢复额定、漂移卡(A<B)重新钉频、新列卡 A==B 仍钉频、连续空清单跳过、首轮空清单仍 clean、no-op 跳过仍发指标。
 - `features/nputurbo/cli_test.go`:`RunOnce` 强制 dry-run、空清单、straggler 失败报错、skipped 展示、npu_turbo binary 行、轮次行/过期 WARNING 展示。
 - 平台签名同步:`GOOS=windows go build ./cmd/catmonitor`(npu_dvfs stub 路径)。
 - 运行:`make lint && make test`(无 NPU/GPU 环境 mock + 优雅降级,项目既有约定)。

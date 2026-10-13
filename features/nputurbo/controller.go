@@ -67,6 +67,16 @@ type Controller struct {
 	// only the actuator — no locking needed.
 	lastKey roundKey
 	hasKey  bool
+
+	// lastRows is the (device → target) set of the last fully applied plan —
+	// the reference for the no-op skip: a new round whose rows are identical
+	// and whose every target is verifiably still holding on the hardware
+	// needs no actuation at all. Never cleared: a stale lastRows (e.g. after
+	// a stale-path restore) is self-correcting because the A ≥ B check reads
+	// the live snapshot. hasRows guards the very first cycle — a nil lastRows
+	// must not match an empty plan (the first empty round still cleans).
+	lastRows []BoostRow
+	hasRows  bool
 }
 
 func NewController(cfg Config, stragg StragglerSource, actuator *Actuator, freqs FreqProvider, store Storage) *Controller {
@@ -112,9 +122,11 @@ func (c *Controller) Restore() {
 
 // tick is exported for tests; it runs one control cycle. Round-deduplicated
 // model: a round identical to the last fully applied one triggers no
-// actuation; a new round restores everything, then applies the fresh boost
-// list (above-rated batch first, then per-device pins — the order matters
-// because the above-rated batch's lower-others step would overwrite earlier
+// actuation, and neither does a new round whose plan matches the last applied
+// one with every target verifiably still holding (A ≥ B — the no-op skip);
+// any other new round restores everything, then applies the fresh boost list
+// (above-rated batch first, then per-device pins — the order matters because
+// the above-rated batch's lower-others step would overwrite earlier
 // per-device pins); a stale round (older than straggler_max_age) restores
 // everything and boosts nothing — the detector stopped updating, and
 // boosting on its last word forever is never right.
@@ -144,6 +156,17 @@ func (c *Controller) tick(now time.Time) {
 	if key, ok := p.round.Key(); ok && c.hasKey && key == c.lastKey {
 		c.logger.Info(fmt.Sprintf("nputurbo: straggler round unchanged (id %d started %s) — skipping actuation this cycle",
 			p.round.ID, formatStartedAt(p.round.StartedAt)))
+		c.emitMetrics(now, p, len(p.rows))
+		return
+	}
+	// No-op detection: a NEW round whose plan is identical to the last fully
+	// applied one, with every target verifiably still holding on the hardware
+	// (A ≥ B from the fresh snapshot) — nothing to change. This is the steady
+	// state for a card already boosted to its cap: re-running the cycle would
+	// dip it to rated for the ~18s npu_turbo exec for no benefit.
+	if c.sameTargets(p) {
+		c.logger.Info(fmt.Sprintf("nputurbo: plan unchanged and all %d target(s) already at frequency — skipping actuation this cycle", len(p.rows)))
+		c.recordRound(p)
 		c.emitMetrics(now, p, len(p.rows))
 		return
 	}
@@ -214,11 +237,41 @@ func (c *Controller) tick(now time.Time) {
 
 // recordRound remembers the plan's round as processed, enabling the
 // same-round skip on subsequent fetches (no-op for rounds without the
-// (id, started_at) identity — those are never deduped).
+// (id, started_at) identity — those are never deduped). It also remembers
+// the plan's rows as the last applied targets for the no-op skip.
 func (c *Controller) recordRound(p plan) {
 	if key, ok := p.round.Key(); ok {
 		c.lastKey, c.hasKey = key, true
 	}
+	c.lastRows = append([]BoostRow(nil), p.rows...)
+	c.hasRows = true
+}
+
+// sameTargets reports whether the plan is a verified no-op: its rows are
+// exactly the last fully applied rows (same devices, same target frequencies)
+// and every target is already holding on the hardware (row.A ≥ row.B from the
+// fresh snapshot). Set equality — not just the A ≥ B check — is load-bearing:
+// a device that left the list (recovered) or changed target must run the full
+// cycle, whose CleanAll is what restores recovered devices to rated; a device
+// new to the list must be pinned even when already at its frequency (the
+// pin's close-idle is what makes the target durable). A ≥ B rather than ==
+// because the npu_turbo tool lands on 1854–1879 against a nominal 1850, so
+// exact equality would never hold for boosted cards.
+func (c *Controller) sameTargets(p plan) bool {
+	if !c.hasRows || len(p.rows) != len(c.lastRows) {
+		return false
+	}
+	target := make(map[int]int, len(c.lastRows))
+	for _, r := range c.lastRows {
+		target[r.ID] = r.B
+	}
+	for _, r := range p.rows {
+		b, ok := target[r.ID]
+		if !ok || b != r.B || r.A < r.B {
+			return false
+		}
+	}
+	return true
 }
 
 // plan is one control cycle's read-only computation (no actuation).
@@ -235,13 +288,16 @@ type plan struct {
 // (ParseLatestRound); A is the device's live aicore_freq from the
 // FreqProvider (snapshot_npu.json); M is looked up from aicore_rated_freq via
 // the static rated→max table. A listed device lands in rows (with B) when
-// score>1 and its frequencies are processable; anything else is reported in
+// score>1 and its frequencies are processable — including one already at or
+// above its cap (B = M: the npu_turbo tool lands on 1854–1879 against the
+// nominal 1850, and excluding such a card would let the cycle's restore/lower
+// steps demote a still-slow card to rated); anything else is reported in
 // plan.skipped with a reason (score≤1 → treated as not listed; missing freq
-// data; unmapped rating; current above cap — never downclock). A stale round
-// short-circuits with stale=true and no rows. A slow-device list with
-// entries but an empty freq map is an error (caller no-ops the whole tick —
-// same philosophy as a straggler failure: no input, no actuation). Shared by
-// tick (which then actuates) and RunOnce (CLI preview, which does not).
+// data; unmapped rating). A stale round short-circuits with stale=true and no
+// rows. A slow-device list with entries but an empty freq map is an error
+// (caller no-ops the whole tick — same philosophy as a straggler failure: no
+// input, no actuation). Shared by tick (which then actuates) and RunOnce
+// (CLI preview, which does not).
 func (c *Controller) planBoosts(now time.Time) (plan, error) {
 	sctx, scancel := context.WithTimeout(context.Background(), c.stragglerTimeout())
 	defer scancel()
@@ -289,15 +345,10 @@ func (c *Controller) planBoosts(now time.Time) (plan, error) {
 				Reason: fmt.Sprintf("rated %d MHz is not in the boost cap map", f.Rated)})
 			continue
 		}
-		if f.Current > m {
-			// Current frequency already above the cap: never downclock, leave
-			// the device alone (the per-cycle restore resets it to rated, but
-			// it is never boosted above that).
-			c.logger.Warn(fmt.Sprintf("nputurbo: device %d current %d MHz is already above the boost cap %d MHz; left untouched", sc.ID, f.Current, m))
-			p.skipped = append(p.skipped, SkipRow{ID: sc.ID, Score: sc.Score,
-				Reason: fmt.Sprintf("current %d MHz is already above the boost cap %d MHz", f.Current, m)})
-			continue
-		}
+		// No A>M guard here: a listed card already at or above its cap
+		// (our own boost landed on 1854–1879 against the nominal 1850)
+		// stays in the plan at B=M — excluding it would let the cycle's
+		// restore/lower steps demote a still-slow card to rated.
 		b, _ := ComputeTargetB(f.Current, sc.Score, m, c.cfg.StepMhz)
 		p.rows = append(p.rows, BoostRow{ID: sc.ID, A: f.Current, Rated: f.Rated, M: m, B: b, Score: sc.Score})
 	}
