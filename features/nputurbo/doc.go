@@ -22,7 +22,7 @@
 // the pins — its lower step would overwrite them. A fetch returning the
 // very round that was fully applied last tick triggers no actuation at all
 // (the pins already hold on the hardware), and a round older than
-// straggler_max_age (0 disables) means the detector stopped updating: all
+// straggler_max_age (0s disables) means the detector stopped updating: all
 // devices are restored to rated and nothing is boosted. Devices whose
 // rating is not covered by the static table, or whose current frequency is
 // already above the cap, are never boosted. Docs without round metadata

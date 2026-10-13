@@ -122,7 +122,7 @@ type EnergysaveConfig struct {
 // The result doc carries a round id + started_at: a round identical to the
 // last applied one is not re-applied (round dedupe), and a round older than
 // straggler_max_age means the detector stopped updating — everything is
-// restored to rated and nothing is boosted (0 disables the check).
+// restored to rated and nothing is boosted (0s disables the check).
 // Frequency control is native (DSMI via features/nputurbo/dvfs, the former
 // dvfs.py semantics); only the above-rated global raise execs the external
 // npu_turbo binary at npu_turbo_bin. The feature is off by default and
@@ -133,7 +133,7 @@ type NputurboConfig struct {
 	Interval          time.Duration `yaml:"interval"`            // control loop period (HTTP poll cadence)
 	StragglerURL      string        `yaml:"straggler_url"`       // HTTP GET endpoint returning the slow-card result (profiler doc)
 	StragglerTimeout  time.Duration `yaml:"straggler_timeout"`   // HTTP GET timeout
-	StragglerMaxAge   time.Duration `yaml:"straggler_max_age"`   // rounds older than this are stale (restore-only); 0 disables the check
+	StragglerMaxAge   time.Duration `yaml:"straggler_max_age"`   // rounds older than this are stale (restore-only); 0s disables the check (duration needs a unit — a bare 0 fails to parse)
 	NpuTurboBin       string        `yaml:"npu_turbo_bin"`       // npu_turbo binary (above-rated global raise; exec'd as `<bin> -f <MHz>`)
 	NpuTurboTimeout   time.Duration `yaml:"npu_turbo_timeout"`   // npu_turbo exec timeout
 	StepMhz           int           `yaml:"step_mhz"`            // boost target quantization step

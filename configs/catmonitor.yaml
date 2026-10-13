@@ -132,7 +132,7 @@ energysave:
 # the fresh slow list (above-rated batch first, then per-device ramp pins);
 # the same round fetched again triggers no actuation; a round older than
 # straggler_max_age (detector stopped updating) restores everything to
-# rated and boosts nothing (0 disables the check). dry_run true = judge+log
+# rated and boosts nothing (0s disables the check). dry_run true = judge+log
 # only; set dry_run: false to actuate.
 # See features/nputurbo/nputurbo_SPEC.md.
 nputurbo:
@@ -140,7 +140,7 @@ nputurbo:
   interval: 60s
   straggler_url: "http://127.0.0.1:15432/straggler/result/latest"   # GET → profiler doc (kpi block ignored)
   straggler_timeout: 10s                                    # HTTP GET timeout
-  straggler_max_age: 15m                                    # rounds older than this are stale → restore-only (0 disables)
+  straggler_max_age: 15m                                    # rounds older than this are stale → restore-only (0s disables; a bare 0 is invalid YAML for a duration)
   npu_turbo_bin: "/home/jw/npu_turbo"                        # above-rated global raise tool (exec: <bin> -f <MHz>)
   npu_turbo_timeout: 120s
   step_mhz: 50

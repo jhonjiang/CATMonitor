@@ -25,7 +25,7 @@
 >
 > **修订(2026-09-14 四次)——npu_turbo CWD 修复:** 节点实测发现 `npu_turbo` 按**进程 CWD**(非二进制目录)解析 `lptest` 助手——从无 `lptest` 的目录运行时 `cp lptest lptestN` 失败、`lptestN turbocfg` 全部 exit 127(TDP 恢复不完整)。原包装脚本靠 `cd $(dirname $0)` 规避,原生集成时丢失了该保护,daemon(systemd CWD=/)会以同样方式失败。修复:`realRun` exec 时以二进制目录为 CWD(bare PATH 名除外);部署要求 `npu_turbo_bin` 绝对路径 + `lptest` 同目录。
 >
-> **修订(2026-10-12)——轮次感知(去重 + 防过期):** straggler 结果 doc 顶层新增 `id`(检测轮次号,**检测器进程重启会从 1 重计**)与 `started_at`(该轮检测开始时间,RFC3339,**不随重启重置**)。① **选轮**——`ParseSlowCards` → `ParseLatestRound`:候选 doc 中带 `started_at` 者胜出,取最晚 `started_at`,平局取大 `id`(id 单独不可作序——重启重计,时间戳不会);全无 `started_at` 退化为取末行(旧格式行为)。② **跨 tick 去重**——轮次身份 = `(id, started_at)` 二元组(裸 id 会撞重启);与上次**完整成功**应用的轮次相同 → 本 tick 跳过全部 actuation(pin 在硬件上持续生效,省掉每 60s 的全设备 DSMI 写);actuation 任一步失败则不记录身份 → 下 tick 重试同轮次。③ **防过期**——最新轮次 `now - started_at > straggler_max_age`(新配置,默认 15m,0 关闭)→ 仅 `CleanAll` 恢复额定、不注入(修掉"检测器停更 → 永久 boost"隐患)。`id`/`started_at` 任一缺失 → 不选轮、不去重、不检查(旧格式 = 原"无状态每轮重置"行为,零影响)。新指标:`nputurbo.round_id`、`nputurbo.result_age_seconds`(缺 started_at 发 -1)。
+> **修订(2026-10-12)——轮次感知(去重 + 防过期):** straggler 结果 doc 顶层新增 `id`(检测轮次号,**检测器进程重启会从 1 重计**)与 `started_at`(该轮检测开始时间,RFC3339,**不随重启重置**)。① **选轮**——`ParseSlowCards` → `ParseLatestRound`:候选 doc 中带 `started_at` 者胜出,取最晚 `started_at`,平局取大 `id`(id 单独不可作序——重启重计,时间戳不会);全无 `started_at` 退化为取末行(旧格式行为)。② **跨 tick 去重**——轮次身份 = `(id, started_at)` 二元组(裸 id 会撞重启);与上次**完整成功**应用的轮次相同 → 本 tick 跳过全部 actuation(pin 在硬件上持续生效,省掉每 60s 的全设备 DSMI 写);actuation 任一步失败则不记录身份 → 下 tick 重试同轮次。③ **防过期**——最新轮次 `now - started_at > straggler_max_age`(新配置,默认 15m,YAML 里写 `0s` 关闭——duration 字段不接受裸 `0`,会解析报错)→ 仅 `CleanAll` 恢复额定、不注入(修掉"检测器停更 → 永久 boost"隐患)。`id`/`started_at` 任一缺失 → 不选轮、不去重、不检查(旧格式 = 原"无状态每轮重置"行为,零影响)。新指标:`nputurbo.round_id`、`nputurbo.result_age_seconds`(缺 started_at 发 -1)。
 
 ## 1. 目标
 
@@ -58,7 +58,7 @@ Controller.tick (interval):
 - HTTP 失败(超时 / 非 2xx / 网络错 / DNS)→ 本周期**完全 no-op**(不调频、**不 clean**——拿不到清单无法对齐 desired state)。
 - 响应体为空 / 全行解析失败 → 完全 no-op。
 - 解析成功但 `node_result` 为空 list(无慢卡)→ **不 inject**,但按 §7 clean(所有曾 boost 的卡恢复)。
-- 选中轮次 `started_at` 距今 > `straggler_max_age`(0 关闭;doc 无 `started_at` 不检查)→ **仅 clean**(恢复全部到额定,不注入)——检测器停更后不能按其最后一词永久 boost。
+- 选中轮次 `started_at` 距今 > `straggler_max_age`(YAML 写 `0s` 关闭;doc 无 `started_at` 不检查)→ **仅 clean**(恢复全部到额定,不注入)——检测器停更后不能按其最后一词永久 boost。
 - `straggler_url` 为空 → nputurbo 不启动(与 `enabled:false` 同效,启动日志报错)。
 
 straggler 接口由 daemon HTTP GET 获取,与本仓库 `features/stragglerout/` 无关(后者是 KPI 输出,不影响本特性)。
@@ -135,7 +135,7 @@ nputurbo:
   interval: 60s
   straggler_url: "http://127.0.0.1:15432/straggler/result/latest"   # GET → profiler doc(顶层 kpi 块自动忽略)
   straggler_timeout: 10s                                    # HTTP GET 超时
-  straggler_max_age: 15m                                    # 轮次过期阈值:age > 此值 → 仅恢复额定不注入;0 关闭(默认 15m)
+  straggler_max_age: 15m                                    # 轮次过期阈值:age > 此值 → 仅恢复额定不注入;0s 关闭(默认 15m;duration 必须带单位,裸 0 解析报错)
   npu_turbo_bin: "/home/jw/npu_turbo"                        # 全局抬频二进制(exec: <bin> -f <MHz>),仅 B>额定 需要
                                                                 # 注意:必须绝对路径,且 lptest 助手与二进制同目录(见 §12)
   npu_turbo_timeout: 120s
@@ -177,7 +177,7 @@ CATMonitor nputurbo (read-only preview — no frequencies are changed)
 - `features/nputurbo/freq_test.go`:映射表查找(1800→1850 命中/未映射 miss)、`SnapshotFreqProvider` 从 snapshot fixture 提取(单芯片 device id==npu_id / A3 双芯片全局 id `npu×2+chip` 每 chip 独立条目 / 缺 rated / 缺 chip_id 回退 npu_id / 缺文件空 map)。
 - `features/nputurbo/formula_test.go`:边界(`A×score>M` 截断、取整 50 边界、`score≤1` 跳过、`A>M` 不操作、A=M 封顶)。
 - `features/nputurbo/actuator_test.go`(fakeDVFS/fakeRaiser):CleanAll 用**各自额定**(混布 1800/2000)、单设备失败隔离;BoostAbove 先抬频后降非目标、目标不被 dvfs 触碰、抬频失败中止;BoostAtOrBelow 钉住(不重开 idle);Available/TurboAvailable。
-- `features/nputurbo/controller_test.go`:clean→批量→钉频**顺序**断言、多卡>额定单次批量、空清单仅 clean、全部跳过仅 clean、score≤1/A>M/缺频率数据不注入、straggler 失败/空 freqs 整轮 no-op、clean 失败仍注入、dry_run 零硬件调用;**轮次语义**——同身份二次 tick 零硬件调用、新轮次(含重启同 id 新 `started_at`)重新执行、actuation 失败后同身份重试、过期仅 CleanAll(`straggler_max_age`=0 关闭、缺 `started_at` 不检查)、去重跳过仍发指标。
+- `features/nputurbo/controller_test.go`:clean→批量→钉频**顺序**断言、多卡>额定单次批量、空清单仅 clean、全部跳过仅 clean、score≤1/A>M/缺频率数据不注入、straggler 失败/空 freqs 整轮 no-op、clean 失败仍注入、dry_run 零硬件调用;**轮次语义**——同身份二次 tick 零硬件调用、新轮次(含重启同 id 新 `started_at`)重新执行、actuation 失败后同身份重试、过期仅 CleanAll(`straggler_max_age`=0s 关闭、缺 `started_at` 不检查)、去重跳过仍发指标。
 - `features/nputurbo/cli_test.go`:`RunOnce` 强制 dry-run、空清单、straggler 失败报错、skipped 展示、npu_turbo binary 行、轮次行/过期 WARNING 展示。
 - 平台签名同步:`GOOS=windows go build ./cmd/catmonitor`(npu_dvfs stub 路径)。
 - 运行:`make lint && make test`(无 NPU/GPU 环境 mock + 优雅降级,项目既有约定)。
